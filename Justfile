@@ -8,11 +8,32 @@ default:
 test:
     uv run python -m unittest discover -s tests
 
-# Compile the scaffold and run its tests.
+# Compile the host/device sources and run their tests.
 check:
-    uv run python -m compileall -q code.py movieportal.py tests
+    uv run python -m compileall -q boot.py code.py movieportal.py mpv_ipc.py protocol.py settings.py stream.py tests
     uv run python -m unittest discover -s tests
+
+# Install the CircuitPython runtime on a mounted board.
+install-device device="/Volumes/CIRCUITPY":
+    cp boot.py code.py movieportal.py protocol.py settings.py {{device}}/
+    sync
+
+# Stream a test pattern or movie. Pass normal stream.py arguments after `--`.
+stream *args:
+    uv run --script stream.py {{args}}
+
+# Stream a movie while preserving spaces in its filename.
+play source *args:
+    uv run --script stream.py play {{quote(source)}} {{args}}
+
+# Follow the open movie and playback controls in IINA.
+iina socket="/tmp/m4-movieportal-mpv.sock" *args:
+    uv run --script stream.py iina --socket {{quote(socket)}} {{args}}
 
 # Attach to the CircuitPython serial console.
 serial:
     discotool repl
+
+# Attach to the dedicated binary data port.
+data:
+    discotool data
