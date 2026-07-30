@@ -91,6 +91,7 @@ any libraries from the CircuitPython bundle.
 - `protocol.py` defines the protocol shared by host and device.
 - `settings.py` contains user-adjustable panel configuration.
 - `stream.py` is the host-side synthetic/FFmpeg streamer.
+- `compare.py` builds multi-timestamp frame comparison PNGs.
 - `tests/` contains host-side unit tests.
 - `Justfile` contains the development commands.
 
@@ -139,6 +140,32 @@ bypass gamma correction and `--no-rgb5-quantizer` to bypass the custom
 five-bit/shadow quantizer. `--scaled-source` disables both in one step, leaving
 only frame-rate conversion, scaling/cropping or padding, display rotation, and
 the required RGB565 packing.
+
+Generate a single PNG comparison across one or more timestamps with:
+
+```sh
+just compare "/path/to/movie.mkv" comparison.png 10 01:15.5 300
+```
+
+Each timestamp becomes a row. The columns are the source frame, the unprocessed
+64x32 scaled frame, and the fully post-processed 64x32 frame. The two panel
+frames are enlarged with nearest-neighbor scaling so individual output pixels
+remain visible. Display rotation is normalized in the PNG so all three columns
+have the source orientation. Pass options such as `--fit crop`,
+`--led-gamma 2.4`, `--no-led-gamma`, `--led-dark-floor 2`, or
+`--no-rgb5-quantizer` after the timestamps to adjust the post-processed column.
+
+For multiple named post-processing variants, use a TOML config:
+
+```sh
+just compare "/path/to/movie.mkv" comparison.png 10 01:15.5 300 \
+  --config comparison.example.toml
+```
+
+The config's `[[variant]]` entries become additional labeled columns after the
+source and scaled-source columns. Copy `comparison.example.toml` when creating
+a new comparison set; each variant can set `led_gamma`, `led_dark_floor`, and
+`rgb5_quantizer` independently.
 
 The global `--port /dev/cu.usbmodem...` and `--fps 15` options must precede
 `play` when invoking `stream.py` directly. For example:

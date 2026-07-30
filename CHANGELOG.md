@@ -19,4 +19,6 @@
   pixel-format conversion from reintroducing colored ordered dithering.
 - Make gamma correction and the custom five-bit quantizer independently
   switchable, with a scaled-source comparison mode that bypasses both.
+- Add a comparison PNG command that lays out source, scaled-source, and
+  post-processed frames as columns across requested timestamp rows.
 - Display IINA's current playhead frame when starting or becoming paused.

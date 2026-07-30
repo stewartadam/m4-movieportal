@@ -1,0 +1,20 @@
+# Optional global geometry setting for the comparison render.
+fit = "letterbox"
+
+[[variant]]
+name = "default"
+led_gamma = 2.2
+led_dark_floor = 0
+rgb5_quantizer = true
+
+[[variant]]
+name = "no gamma"
+led_gamma = 1
+led_dark_floor = 0
+rgb5_quantizer = true
+
+[[variant]]
+name = "no quantizer"
+led_gamma = 2.2
+led_dark_floor = 0
+rgb5_quantizer = false
