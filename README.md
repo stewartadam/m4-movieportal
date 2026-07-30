@@ -121,7 +121,24 @@ it if the computer's audio device adds noticeable latency.
 MoviePortal applies a 2.2 gamma exponent by default before RGB565 quantization
 so gamma-encoded SDR video drives the panel's linear LED output correctly.
 Adjust `--led-gamma` for a particular panel, or use `--led-gamma 1` to disable
-the correction.
+the correction. `--no-led-gamma` is the equivalent explicit on/off control.
+Area scaling and gamma conversion use 16-bit working precision
+so small, dark details are not discarded before quantization. MoviePortal then
+uses stable five-bit output levels. In shadows, it quantizes luminance once
+and adds reduced chroma residuals, producing muted colors without independent
+red/green/blue sparkle. The host packs RGB565 itself so FFmpeg cannot introduce
+colored ordered dithering while reducing the final channel depths.
+`--led-dark-floor LEVEL` adjusts a fine-grained
+luminance cutoff within the first five-bit output step. The default 0 is the
+weakest cutoff; levels 1, 2, and above progressively suppress near-black noise
+without discarding every first-step shadow pixel at once.
+`--no-led-dark-floor` selects level 0.
+
+Each non-scaling stage can be compared independently: use `--no-led-gamma` to
+bypass gamma correction and `--no-rgb5-quantizer` to bypass the custom
+five-bit/shadow quantizer. `--scaled-source` disables both in one step, leaving
+only frame-rate conversion, scaling/cropping or padding, display rotation, and
+the required RGB565 packing.
 
 The global `--port /dev/cu.usbmodem...` and `--fps 15` options must precede
 `play` when invoking `stream.py` directly. For example:
@@ -158,7 +175,16 @@ while paused refreshes that preview at the new position.
 
 Use `just stream -- --port /dev/cu.usbmodem... iina` to select the data port
 explicitly. The `iina` command also accepts `--fit crop`, `--hwaccel none`,
-`--led-gamma VALUE`, and `--socket PATH`.
+`--led-gamma VALUE`, `--no-led-gamma`, `--rgb5-quantizer`,
+`--no-rgb5-quantizer`, `--led-dark-floor LEVEL`, `--no-led-dark-floor`,
+`--scaled-source`, and `--socket PATH`. For example, compare cutoff levels or
+the scaled source without having to repeat the default IINA socket:
+
+```sh
+just iina --led-dark-floor 0
+just iina --led-dark-floor 2
+just iina --scaled-source
+```
 
 To open the CircuitPython console or data port with
 [discotool](https://github.com/Neradoc/discotool):

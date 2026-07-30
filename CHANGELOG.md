@@ -11,5 +11,12 @@
 - Present a one-frame MatrixPortal preview when seeking while IINA is paused.
 - Increase HUB75 output depth to 5 bits per channel (32,768 displayed colors).
 - Add a `DISPLAY_ROTATION` setting for host-rendered movie and test frames.
-- Linearize gamma-encoded SDR video for the HUB75 panel's LED output.
+- Scale and linearize gamma-encoded SDR video at 16-bit working precision for
+  the HUB75 panel.
+- Use hue-preserving five-bit quantization and a fine-grained black cutoff to
+  avoid spurious primary-color dots without erasing muted colors.
+- Pack RGB565 deterministically on the host to prevent FFmpeg's final
+  pixel-format conversion from reintroducing colored ordered dithering.
+- Make gamma correction and the custom five-bit quantizer independently
+  switchable, with a scaled-source comparison mode that bypasses both.
 - Display IINA's current playhead frame when starting or becoming paused.

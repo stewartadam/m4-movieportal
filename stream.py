@@ -25,10 +25,17 @@ from settings import DISPLAY_ROTATION
 WIDTH = 64
 HEIGHT = 32
 FRAME_SIZE = WIDTH * HEIGHT * 2
+RGB24_FRAME_SIZE = WIDTH * HEIGHT * 3
 DEFAULT_FPS = Fraction(24, 1)
 PREBUFFER_FRAMES = 3
 DEFAULT_IINA_SOCKET = "/tmp/m4-movieportal-mpv.sock"
 DEFAULT_LED_GAMMA = 2.2
+RGB5_MAX = 31
+RGB_WORK_MAX = 65535
+DEFAULT_LED_DARK_FLOOR = 0
+SHADOW_CHROMA_MAX_LEVEL = 4
+SHADOW_CHROMA_DIVISOR = 2
+DARK_FLOOR_SUBSTEPS = 64
 
 
 def parse_frame_rate(value):
@@ -53,29 +60,137 @@ def parse_led_gamma(value):
     return gamma
 
 
-def build_video_filter(fit, led_gamma=DEFAULT_LED_GAMMA):
+def parse_led_dark_floor(value):
+    """Parse a five-bit level used as the pixel black cutoff."""
+    try:
+        level = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "LED dark floor must be an integer"
+        ) from error
+    if not 0 <= level <= RGB5_MAX:
+        raise argparse.ArgumentTypeError(
+            "LED dark floor must be between 0 and {}".format(RGB5_MAX)
+        )
+    return level
+
+
+def build_rgb5_levels(dark_floor=DEFAULT_LED_DARK_FLOOR):
+    """Build stable five-bit levels with correlated shadow chroma."""
+    rounded = {
+        component: "floor({}(X,Y)*{}/{}+0.5)".format(
+            component,
+            RGB5_MAX,
+            RGB_WORK_MAX,
+        )
+        for component in "rgb"
+    }
+    peak_level = "max(max({r},{g}),{b})".format(**rounded)
+    luma = "(0.2126*r(X,Y)+0.7152*g(X,Y)+0.0722*b(X,Y))"
+    rounded_luma = (
+        "floor((0.2126*r(X,Y)+0.7152*g(X,Y)+0.0722*b(X,Y))"
+        "*{}/{}+0.5)".format(RGB5_MAX, RGB_WORK_MAX)
+    )
+    luma_signal = "gte({}*{}*{},{}*{})".format(
+        luma,
+        RGB5_MAX,
+        DARK_FLOOR_SUBSTEPS,
+        RGB_WORK_MAX,
+        dark_floor + 1,
+    )
+    luma_level = "if({},max({},1),{})".format(
+        luma_signal,
+        rounded_luma,
+        rounded_luma,
+    )
+    levels = {}
+    for component in "rgb":
+        chroma = "(({}(X,Y)-{})*{}/{}/{})".format(
+            component,
+            luma,
+            RGB5_MAX,
+            RGB_WORK_MAX,
+            SHADOW_CHROMA_DIVISOR,
+        )
+        chroma_level = (
+            "if(gte({chroma},0),"
+            "floor({chroma}+0.5),ceil({chroma}-0.5))"
+        ).format(chroma=chroma)
+        shadow_level = "clip({}+{},0,{})".format(
+            luma_level,
+            chroma_level,
+            RGB5_MAX,
+        )
+        levels[component] = "if(lte({},{}),{},{})".format(
+            peak_level,
+            SHADOW_CHROMA_MAX_LEVEL,
+            shadow_level,
+            rounded[component],
+        )
+
+    return levels
+
+
+def build_rgb5_quantizer(component, levels):
+    """Build a stable five-bit quantizer for one RGB component."""
+    return "{}*{}/{}".format(
+        levels[component],
+        RGB_WORK_MAX,
+        RGB5_MAX,
+    )
+
+
+def build_video_filter(
+    fit,
+    led_gamma=DEFAULT_LED_GAMMA,
+    led_dark_floor=DEFAULT_LED_DARK_FLOOR,
+    rgb5_quantizer=True,
+    scaled_source=False,
+):
     """Build the 64x32 scale/crop and LED transfer filter graph."""
     if not math.isfinite(led_gamma) or led_gamma <= 0:
         raise ValueError("LED gamma must be positive and finite")
+    if (
+        not isinstance(led_dark_floor, int)
+        or not 0 <= led_dark_floor <= RGB5_MAX
+    ):
+        raise ValueError(
+            "LED dark floor must be an integer between 0 and {}".format(
+                RGB5_MAX
+            )
+        )
+    if scaled_source:
+        led_gamma = 1
+        rgb5_quantizer = False
+    filters = "fps={fps},format=gbrp16le"
     if fit == "crop":
-        filters = (
-            "fps={fps},"
+        filters += (
+            ","
             "scale=64:32:force_original_aspect_ratio=increase:flags=area,"
             "crop=64:32"
         )
     else:
-        filters = (
-            "fps={fps},"
+        filters += (
+            ","
             "scale=64:32:force_original_aspect_ratio=decrease:flags=area,"
             "pad=64:32:(ow-iw)/2:(oh-ih)/2:color=black"
         )
     if led_gamma != 1:
         gamma = "{:g}".format(led_gamma)
-        expression = "pow(val/255,{})*255".format(gamma)
+        expression = "pow(val/maxval,{})*maxval".format(gamma)
         filters += (
-            ",format=rgb24,"
-            "lutrgb=r='{expression}':g='{expression}':b='{expression}'"
+            ",lutrgb=r='{expression}':g='{expression}':b='{expression}'"
         ).format(expression=expression)
+    if rgb5_quantizer:
+        levels = build_rgb5_levels(led_dark_floor)
+        expressions = {
+            component: build_rgb5_quantizer(component, levels)
+            for component in "rgb"
+        }
+        filters += ",geq=r='{r}':g='{g}':b='{b}':i=nearest".format(
+            **expressions
+        )
+    filters += ",format=rgb24"
     if DISPLAY_ROTATION == 180:
         filters += ",hflip,vflip"
     elif DISPLAY_ROTATION != 0:
@@ -92,8 +207,11 @@ def build_ffmpeg_command(
     start_time=0,
     max_frames=None,
     led_gamma=DEFAULT_LED_GAMMA,
+    led_dark_floor=DEFAULT_LED_DARK_FLOOR,
+    rgb5_quantizer=True,
+    scaled_source=False,
 ):
-    """Build an FFmpeg raw RGB565 decoding command."""
+    """Build an FFmpeg RGB24 command for deterministic host-side packing."""
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RuntimeError("ffmpeg was not found in PATH")
@@ -114,9 +232,15 @@ def build_ffmpeg_command(
     command.extend(
         [
             "-vf",
-            build_video_filter(fit, led_gamma).format(fps=fps_text),
+            build_video_filter(
+                fit,
+                led_gamma,
+                led_dark_floor,
+                rgb5_quantizer,
+                scaled_source,
+            ).format(fps=fps_text),
             "-pix_fmt",
-            "rgb565le",
+            "rgb24",
         ]
     )
     if max_frames is not None:
@@ -146,6 +270,26 @@ def read_exact(stream, size):
     return b"".join(chunks)
 
 
+def pack_rgb565(rgb24):
+    """Pack RGB24 without the color-channel dithering used by swscale."""
+    if len(rgb24) != RGB24_FRAME_SIZE:
+        raise ValueError(
+            "RGB24 frame must contain {} bytes".format(RGB24_FRAME_SIZE)
+        )
+
+    packed = bytearray(FRAME_SIZE)
+    output_offset = 0
+    for input_offset in range(0, RGB24_FRAME_SIZE, 3):
+        red = (rgb24[input_offset] * 31 + 127) // 255
+        green = (rgb24[input_offset + 1] * 63 + 127) // 255
+        blue = (rgb24[input_offset + 2] * 31 + 127) // 255
+        pixel = (red << 11) | (green << 5) | blue
+        packed[output_offset] = pixel & 0xFF
+        packed[output_offset + 1] = pixel >> 8
+        output_offset += 2
+    return bytes(packed)
+
+
 def ffmpeg_frames(
     source,
     frame_rate,
@@ -155,6 +299,9 @@ def ffmpeg_frames(
     start_time=0,
     max_frames=None,
     led_gamma=DEFAULT_LED_GAMMA,
+    led_dark_floor=DEFAULT_LED_DARK_FLOOR,
+    rgb5_quantizer=True,
+    scaled_source=False,
 ):
     """Yield decoded frames from FFmpeg."""
     command = build_ffmpeg_command(
@@ -166,6 +313,9 @@ def ffmpeg_frames(
         start_time,
         max_frames,
         led_gamma,
+        led_dark_floor,
+        rgb5_quantizer,
+        scaled_source,
     )
     print("Decoder:", " ".join(command), file=sys.stderr)
     process = subprocess.Popen(
@@ -176,10 +326,10 @@ def ffmpeg_frames(
     completed = False
     try:
         while True:
-            frame = read_exact(process.stdout, FRAME_SIZE)
-            if not frame:
+            rgb24 = read_exact(process.stdout, RGB24_FRAME_SIZE)
+            if not rgb24:
                 break
-            yield frame
+            yield pack_rgb565(rgb24)
         completed = True
     finally:
         stopping = not completed and process.poll() is None
@@ -761,6 +911,53 @@ def stream_frames(
     }
 
 
+def add_video_preprocessing_arguments(parser):
+    """Add the LED transfer controls shared by movie playback commands."""
+    gamma = parser.add_mutually_exclusive_group()
+    gamma.add_argument(
+        "--led-gamma",
+        type=parse_led_gamma,
+        default=DEFAULT_LED_GAMMA,
+        help="LED gamma exponent (default: %(default)s)",
+    )
+    gamma.add_argument(
+        "--no-led-gamma",
+        dest="led_gamma",
+        action="store_const",
+        const=1,
+        help="disable LED gamma correction",
+    )
+    parser.add_argument(
+        "--rgb5-quantizer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="apply the custom five-bit shadow quantizer (default: enabled)",
+    )
+    dark_floor = parser.add_mutually_exclusive_group()
+    dark_floor.add_argument(
+        "--led-dark-floor",
+        type=parse_led_dark_floor,
+        default=DEFAULT_LED_DARK_FLOOR,
+        metavar="LEVEL",
+        help="pixel black cutoff, 0-31 (default: %(default)s)",
+    )
+    dark_floor.add_argument(
+        "--no-led-dark-floor",
+        dest="led_dark_floor",
+        action="store_const",
+        const=0,
+        help="select the weakest LED dark cutoff",
+    )
+    parser.add_argument(
+        "--scaled-source",
+        action="store_true",
+        help=(
+            "send only the scaled source image, bypassing LED gamma and "
+            "the custom five-bit quantizer"
+        ),
+    )
+
+
 def create_parser():
     parser = argparse.ArgumentParser(
         description="Stream RGB565 video to an M4 MoviePortal"
@@ -798,12 +995,7 @@ def create_parser():
         default="auto",
         help="FFmpeg hardware decoder: auto, none, or a platform name",
     )
-    play_parser.add_argument(
-        "--led-gamma",
-        type=parse_led_gamma,
-        default=DEFAULT_LED_GAMMA,
-        help="LED gamma exponent; use 1 to disable (default: %(default)s)",
-    )
+    add_video_preprocessing_arguments(play_parser)
     play_parser.add_argument(
         "--no-audio",
         action="store_true",
@@ -839,12 +1031,7 @@ def create_parser():
         default="auto",
         help="FFmpeg hardware decoder: auto, none, or a platform name",
     )
-    iina_parser.add_argument(
-        "--led-gamma",
-        type=parse_led_gamma,
-        default=DEFAULT_LED_GAMMA,
-        help="LED gamma exponent; use 1 to disable (default: %(default)s)",
-    )
+    add_video_preprocessing_arguments(iina_parser)
     return parser
 
 
@@ -901,6 +1088,9 @@ def stream_from_iina(args):
                         start_time=start_time,
                         max_frames=1 if preview else None,
                         led_gamma=args.led_gamma,
+                        led_dark_floor=args.led_dark_floor,
+                        rgb5_quantizer=args.rgb5_quantizer,
+                        scaled_source=args.scaled_source,
                     )
                     try:
                         stream_frames(
@@ -961,6 +1151,9 @@ def main(argv=None):
             args.hwaccel,
             start_time=args.start,
             led_gamma=args.led_gamma,
+            led_dark_floor=args.led_dark_floor,
+            rgb5_quantizer=args.rgb5_quantizer,
+            scaled_source=args.scaled_source,
         )
         if args.no_audio:
             start_callback = None

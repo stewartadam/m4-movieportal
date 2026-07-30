@@ -74,7 +74,7 @@ class StreamTests(unittest.TestCase):
         )
 
     @patch("stream.shutil.which", return_value="/opt/bin/ffmpeg")
-    def test_ffmpeg_uses_auto_hardware_decode_and_rgb565(self, _which):
+    def test_ffmpeg_uses_auto_hardware_decode_and_stable_rgb24(self, _which):
         command = stream.build_ffmpeg_command(
             Path("/tmp/movie.mkv"),
             Fraction(24, 1),
@@ -85,14 +85,35 @@ class StreamTests(unittest.TestCase):
 
         self.assertIn("-hwaccel", command)
         self.assertEqual(command[command.index("-hwaccel") + 1], "auto")
-        self.assertEqual(command[command.index("-pix_fmt") + 1], "rgb565le")
+        self.assertEqual(command[command.index("-pix_fmt") + 1], "rgb24")
         self.assertIn(
             "force_original_aspect_ratio=decrease",
             command[command.index("-vf") + 1],
         )
         self.assertIn(
-            "pow(val/255,2.2)*255",
+            "pow(val/maxval,2.2)*maxval",
             command[command.index("-vf") + 1],
+        )
+        self.assertIn(
+            "0.2126*r(X,Y)+0.7152*g(X,Y)+0.0722*b(X,Y)",
+            command[command.index("-vf") + 1],
+        )
+        self.assertIn(
+            "ceil(((r(X,Y)-",
+            command[command.index("-vf") + 1],
+        )
+        video_filter = command[command.index("-vf") + 1]
+        self.assertLess(
+            video_filter.index("format=gbrp16le"),
+            video_filter.index("scale=64:32"),
+        )
+        self.assertLess(
+            video_filter.index("scale=64:32"),
+            video_filter.index("lutrgb"),
+        )
+        self.assertLess(
+            video_filter.index("geq="),
+            video_filter.index("format=rgb24"),
         )
         self.assertTrue(command[command.index("-vf") + 1].endswith(",hflip,vflip"))
         self.assertEqual(command[-1], "pipe:1")
@@ -137,12 +158,68 @@ class StreamTests(unittest.TestCase):
         video_filter = stream.build_video_filter("letterbox", led_gamma=1)
 
         self.assertNotIn("lutrgb", video_filter)
+        self.assertIn("geq", video_filter)
+
+    def test_filter_can_disable_custom_rgb5_quantizer(self):
+        video_filter = stream.build_video_filter(
+            "letterbox",
+            rgb5_quantizer=False,
+        )
+
+        self.assertIn("lutrgb", video_filter)
+        self.assertNotIn("geq", video_filter)
+
+    def test_filter_can_send_only_the_scaled_source(self):
+        video_filter = stream.build_video_filter(
+            "letterbox",
+            led_gamma=2.8,
+            rgb5_quantizer=True,
+            scaled_source=True,
+        )
+
+        self.assertIn("scale=64:32", video_filter)
+        self.assertNotIn("lutrgb", video_filter)
+        self.assertNotIn("geq", video_filter)
+        self.assertTrue(video_filter.endswith(",hflip,vflip"))
+
+    def test_filter_uses_the_weakest_led_dark_floor_at_zero(self):
+        levels = stream.build_rgb5_levels(0)
+
+        self.assertIn(
+            "*31*64,65535*1)",
+            levels["r"],
+        )
+        self.assertEqual(
+            stream.build_rgb5_quantizer("r", levels),
+            "{}*65535/31".format(levels["r"]),
+        )
+
+    def test_led_dark_floor_moves_the_substep_luma_cutoff(self):
+        level_zero = stream.build_rgb5_levels(0)
+        level_two = stream.build_rgb5_levels(2)
+
+        self.assertIn("*31*64,65535*1)", level_zero["r"])
+        self.assertIn("*31*64,65535*3)", level_two["r"])
+
+    def test_shadows_use_reduced_correlated_chroma(self):
+        levels = stream.build_rgb5_levels()
+
+        self.assertIn("*31/65535/2)", levels["r"])
 
     def test_filter_rejects_invalid_led_gamma(self):
         for gamma in (0, -1, float("nan"), float("inf")):
             with self.subTest(gamma=gamma):
                 with self.assertRaisesRegex(ValueError, "LED gamma"):
                     stream.build_video_filter("letterbox", led_gamma=gamma)
+
+    def test_filter_rejects_invalid_led_dark_floor(self):
+        for level in (-1, 32, 1.5):
+            with self.subTest(level=level):
+                with self.assertRaisesRegex(ValueError, "LED dark floor"):
+                    stream.build_video_filter(
+                        "letterbox",
+                        led_dark_floor=level,
+                    )
 
     @patch("stream.DISPLAY_ROTATION", 90)
     def test_filter_rejects_unsupported_rotation(self):
@@ -199,6 +276,17 @@ class StreamTests(unittest.TestCase):
 
         self.assertEqual(len(frames), 2)
         self.assertTrue(all(len(frame) == stream.FRAME_SIZE for frame in frames))
+
+    def test_rgb565_packing_is_stable_for_low_neutral_grey(self):
+        rgb24 = bytes((8, 8, 8)) * (stream.WIDTH * stream.HEIGHT)
+
+        frame = stream.pack_rgb565(rgb24)
+
+        self.assertEqual(frame, bytes((0x41, 0x08)) * (stream.WIDTH * stream.HEIGHT))
+
+    def test_rgb565_packing_rejects_incomplete_frames(self):
+        with self.assertRaisesRegex(ValueError, "RGB24 frame"):
+            stream.pack_rgb565(bytes(stream.RGB24_FRAME_SIZE - 1))
 
     def test_interrupted_stream_consumes_the_stop_response(self):
         class CloseableFrames:
@@ -263,6 +351,43 @@ class StreamTests(unittest.TestCase):
 
         self.assertEqual(args.socket, stream.DEFAULT_IINA_SOCKET)
         self.assertEqual(args.led_gamma, stream.DEFAULT_LED_GAMMA)
+        self.assertTrue(args.rgb5_quantizer)
+        self.assertFalse(args.scaled_source)
+        self.assertEqual(
+            args.led_dark_floor,
+            stream.DEFAULT_LED_DARK_FLOOR,
+        )
+
+    def test_iina_command_can_disable_each_preprocessing_stage(self):
+        args = stream.create_parser().parse_args(
+            [
+                "iina",
+                "--no-led-gamma",
+                "--no-rgb5-quantizer",
+            ]
+        )
+
+        self.assertEqual(args.led_gamma, 1)
+        self.assertFalse(args.rgb5_quantizer)
+
+    def test_play_command_can_select_scaled_source_comparison(self):
+        args = stream.create_parser().parse_args(
+            ["play", "/tmp/movie.mkv", "--scaled-source"]
+        )
+
+        self.assertTrue(args.scaled_source)
+
+    def test_iina_command_can_select_weakest_led_dark_floor(self):
+        args = stream.create_parser().parse_args(["iina", "--no-led-dark-floor"])
+
+        self.assertEqual(args.led_dark_floor, 0)
+
+    def test_iina_command_can_set_led_dark_floor(self):
+        args = stream.create_parser().parse_args(
+            ["iina", "--led-dark-floor", "3"]
+        )
+
+        self.assertEqual(args.led_dark_floor, 3)
 
     def test_iina_waits_for_a_movie_to_open(self):
         class OpeningIpc(self.FakeIpc):

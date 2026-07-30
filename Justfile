@@ -27,8 +27,8 @@ play source *args:
     uv run --script stream.py play {{quote(source)}} {{args}}
 
 # Follow the open movie and playback controls in IINA.
-iina socket="/tmp/m4-movieportal-mpv.sock" *args:
-    uv run --script stream.py iina --socket {{quote(socket)}} {{args}}
+iina *args:
+    uv run --script stream.py iina --socket /tmp/m4-movieportal-mpv.sock {{args}}
 
 # Attach to the CircuitPython serial console.
 serial:
