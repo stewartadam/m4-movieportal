@@ -113,9 +113,15 @@ just play "/path/to/movie.mkv"
 ```
 
 Useful options include `--fit crop`, `--duration 5`, `--hwaccel none`,
-`--start 300`, `--no-audio`, `--volume 75`, and `--audio-delay-ms 200`.
+`--start 300`, `--no-audio`, `--volume 75`, `--audio-delay-ms 200`, and
+`--led-gamma 2.2`.
 The audio delay defaults to the same 250 ms preroll used by the device; adjust
 it if the computer's audio device adds noticeable latency.
+
+MoviePortal applies a 2.2 gamma exponent by default before RGB565 quantization
+so gamma-encoded SDR video drives the panel's linear LED output correctly.
+Adjust `--led-gamma` for a particular panel, or use `--led-gamma 1` to disable
+the correction.
 
 The global `--port /dev/cu.usbmodem...` and `--fps 15` options must precede
 `play` when invoking `stream.py` directly. For example:
@@ -147,12 +153,12 @@ just iina
 
 MoviePortal briefly pauses IINA while it seeks FFmpeg and prebuffers the panel,
 then resumes both against the same preroll. Pausing IINA stops the USB session
-and leaves the last displayed matrix frame in place; seeking while paused
-flushes that frame and presents a one-frame preview at the new position.
+and presents a one-frame preview at the current playhead position; seeking
+while paused refreshes that preview at the new position.
 
 Use `just stream -- --port /dev/cu.usbmodem... iina` to select the data port
-explicitly. The `iina` command also accepts `--fit crop`, `--hwaccel none`, and
-`--socket PATH`.
+explicitly. The `iina` command also accepts `--fit crop`, `--hwaccel none`,
+`--led-gamma VALUE`, and `--socket PATH`.
 
 To open the CircuitPython console or data port with
 [discotool](https://github.com/Neradoc/discotool):

@@ -7,6 +7,7 @@
 import argparse
 from collections import deque
 from fractions import Fraction
+import math
 from pathlib import Path
 import queue
 import shutil
@@ -27,6 +28,7 @@ FRAME_SIZE = WIDTH * HEIGHT * 2
 DEFAULT_FPS = Fraction(24, 1)
 PREBUFFER_FRAMES = 3
 DEFAULT_IINA_SOCKET = "/tmp/m4-movieportal-mpv.sock"
+DEFAULT_LED_GAMMA = 2.2
 
 
 def parse_frame_rate(value):
@@ -40,8 +42,21 @@ def parse_frame_rate(value):
     return rate
 
 
-def build_video_filter(fit):
-    """Build the 64x32 scale/crop filter graph."""
+def parse_led_gamma(value):
+    """Parse a positive, finite LED gamma exponent."""
+    try:
+        gamma = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("LED gamma must be a number") from error
+    if not math.isfinite(gamma) or gamma <= 0:
+        raise argparse.ArgumentTypeError("LED gamma must be positive and finite")
+    return gamma
+
+
+def build_video_filter(fit, led_gamma=DEFAULT_LED_GAMMA):
+    """Build the 64x32 scale/crop and LED transfer filter graph."""
+    if not math.isfinite(led_gamma) or led_gamma <= 0:
+        raise ValueError("LED gamma must be positive and finite")
     if fit == "crop":
         filters = (
             "fps={fps},"
@@ -54,6 +69,13 @@ def build_video_filter(fit):
             "scale=64:32:force_original_aspect_ratio=decrease:flags=area,"
             "pad=64:32:(ow-iw)/2:(oh-ih)/2:color=black"
         )
+    if led_gamma != 1:
+        gamma = "{:g}".format(led_gamma)
+        expression = "pow(val/255,{})*255".format(gamma)
+        filters += (
+            ",format=rgb24,"
+            "lutrgb=r='{expression}':g='{expression}':b='{expression}'"
+        ).format(expression=expression)
     if DISPLAY_ROTATION == 180:
         filters += ",hflip,vflip"
     elif DISPLAY_ROTATION != 0:
@@ -69,6 +91,7 @@ def build_ffmpeg_command(
     hwaccel="auto",
     start_time=0,
     max_frames=None,
+    led_gamma=DEFAULT_LED_GAMMA,
 ):
     """Build an FFmpeg raw RGB565 decoding command."""
     ffmpeg = shutil.which("ffmpeg")
@@ -91,7 +114,7 @@ def build_ffmpeg_command(
     command.extend(
         [
             "-vf",
-            build_video_filter(fit).format(fps=fps_text),
+            build_video_filter(fit, led_gamma).format(fps=fps_text),
             "-pix_fmt",
             "rgb565le",
         ]
@@ -131,6 +154,7 @@ def ffmpeg_frames(
     hwaccel,
     start_time=0,
     max_frames=None,
+    led_gamma=DEFAULT_LED_GAMMA,
 ):
     """Yield decoded frames from FFmpeg."""
     command = build_ffmpeg_command(
@@ -141,6 +165,7 @@ def ffmpeg_frames(
         hwaccel,
         start_time,
         max_frames,
+        led_gamma,
     )
     print("Decoder:", " ".join(command), file=sys.stderr)
     process = subprocess.Popen(
@@ -294,6 +319,7 @@ class IinaPlaybackControl:
         self._release_timer = None
         self._errors = queue.Queue()
         self._initial_pause_event = True
+        self._paused_previewed = False
         self.sync_held = False
         self.resume_after_sync = False
         self.ipc.observe_property(self.PAUSE_OBSERVER_ID, "pause")
@@ -389,41 +415,71 @@ class IinaPlaybackControl:
         if error is not None:
             raise error
 
-        while True:
-            event = self.ipc.next_event()
-            if event is None:
-                return
-            self._raise_connection_event(event)
-            event_name = event.get("event")
-            if (
-                event_name == "property-change"
-                and event.get("name") == "pause"
-            ):
-                self._handle_pause_change(bool(event.get("data")))
-            elif event_name in ("seek", "start-file"):
-                if not self._hold_for_resync():
-                    raise PausedSeekRequested()
-                raise PlaybackInterrupted("IINA playback position changed")
-            elif event_name == "end-file":
-                self._cancel_release()
-                raise PlayerEnded()
-
-    def wait_until_playing(self):
-        """Wait without busy-spinning while IINA is paused."""
-        announced = False
+        pause_interruption = None
+        seek_interruption = None
+        position_changed = False
+        player_ended = False
         while True:
             while True:
                 event = self.ipc.next_event()
                 if event is None:
                     break
                 self._raise_connection_event(event)
+                event_name = event.get("event")
+                if (
+                    event_name == "property-change"
+                    and event.get("name") == "pause"
+                ):
+                    try:
+                        self._handle_pause_change(bool(event.get("data")))
+                    except PlaybackInterrupted as error:
+                        pause_interruption = error
+                elif event_name in ("seek", "start-file"):
+                    position_changed = True
+                elif event_name == "end-file":
+                    self._cancel_release()
+                    player_ended = True
+
+            if player_ended:
+                break
+            if position_changed and seek_interruption is None:
+                if not self._hold_for_resync():
+                    seek_interruption = PausedSeekRequested()
+                else:
+                    seek_interruption = PlaybackInterrupted(
+                        "IINA playback position changed"
+                    )
+                # The synchronous property commands above form an IPC barrier.
+                # Drain events queued before their responses before restarting.
+                continue
+            break
+
+        if player_ended:
+            raise PlayerEnded()
+        if seek_interruption is not None:
+            raise seek_interruption
+        if pause_interruption is not None:
+            raise pause_interruption
+
+    def wait_until_playing(self):
+        """Wait without busy-spinning until IINA has a playing movie."""
+        announced = False
+        pending_event = None
+        seek_pending = False
+        while True:
+            while True:
+                if pending_event is None:
+                    event = self.ipc.next_event()
+                else:
+                    event = pending_event
+                    pending_event = None
+                if event is None:
+                    break
+                self._raise_connection_event(event)
                 if event.get("event") == "end-file":
                     raise PlayerEnded()
-                if (
-                    event.get("event") in ("seek", "start-file")
-                    and self.ipc.get_property("pause")
-                ):
-                    raise PausedSeekRequested()
+                if event.get("event") in ("seek", "start-file"):
+                    seek_pending = True
                 if (
                     event.get("event") == "property-change"
                     and event.get("name") == "pause"
@@ -442,37 +498,35 @@ class IinaPlaybackControl:
             except MpvIpcError:
                 source = None
             paused = bool(self.ipc.get_property("pause"))
+
+            # Property commands form an IPC barrier: by the time their
+            # responses arrive, the reader has queued every earlier seek
+            # event. Drain those events before acting on the batch.
+            pending_event = self.ipc.next_event()
+            if pending_event is not None:
+                continue
+            if source and paused and (
+                seek_pending or not self._paused_previewed
+            ):
+                self._paused_previewed = True
+                raise PausedSeekRequested()
             if source and not paused:
+                self._paused_previewed = False
                 return
             if not source:
-                raise RuntimeError("open a movie in IINA before starting")
-            if paused and not announced:
-                print("IINA is paused; waiting for playback.", file=sys.stderr)
+                self._paused_previewed = False
+            if not announced:
+                if source:
+                    message = (
+                        "IINA is paused; displayed the current frame and "
+                        "waiting for playback."
+                    )
+                else:
+                    message = "IINA has no open movie; waiting for playback."
+                print(message, file=sys.stderr)
                 announced = True
 
-            event = self.ipc.next_event(timeout=0.25)
-            if event is None:
-                continue
-            self._raise_connection_event(event)
-            if event.get("event") == "end-file":
-                raise PlayerEnded()
-            if (
-                event.get("event") in ("seek", "start-file")
-                and self.ipc.get_property("pause")
-            ):
-                raise PausedSeekRequested()
-            if (
-                event.get("event") == "property-change"
-                and event.get("name") == "pause"
-            ):
-                paused = bool(event.get("data"))
-                if self._initial_pause_event:
-                    self._initial_pause_event = False
-                elif (
-                    self._expected_pause
-                    and paused == self._expected_pause[0]
-                ):
-                    self._expected_pause.popleft()
+            pending_event = self.ipc.next_event(timeout=0.25)
 
     def restore_player(self):
         """Undo an internal synchronization pause before exiting."""
@@ -745,6 +799,12 @@ def create_parser():
         help="FFmpeg hardware decoder: auto, none, or a platform name",
     )
     play_parser.add_argument(
+        "--led-gamma",
+        type=parse_led_gamma,
+        default=DEFAULT_LED_GAMMA,
+        help="LED gamma exponent; use 1 to disable (default: %(default)s)",
+    )
+    play_parser.add_argument(
         "--no-audio",
         action="store_true",
         help="disable host audio playback",
@@ -779,6 +839,12 @@ def create_parser():
         default="auto",
         help="FFmpeg hardware decoder: auto, none, or a platform name",
     )
+    iina_parser.add_argument(
+        "--led-gamma",
+        type=parse_led_gamma,
+        default=DEFAULT_LED_GAMMA,
+        help="LED gamma exponent; use 1 to disable (default: %(default)s)",
+    )
     return parser
 
 
@@ -809,7 +875,10 @@ def stream_from_iina(args):
 
                     if preview:
                         source = control.ipc.get_property("path")
-                        start_time = control.ipc.get_property("time-pos") or 0
+                        start_time = max(
+                            0,
+                            control.ipc.get_property("time-pos") or 0,
+                        )
                     else:
                         prepared = control.prepare()
                         if prepared is None:
@@ -831,6 +900,7 @@ def stream_from_iina(args):
                         args.hwaccel,
                         start_time=start_time,
                         max_frames=1 if preview else None,
+                        led_gamma=args.led_gamma,
                     )
                     try:
                         stream_frames(
@@ -890,6 +960,7 @@ def main(argv=None):
             args.duration,
             args.hwaccel,
             start_time=args.start,
+            led_gamma=args.led_gamma,
         )
         if args.no_audio:
             start_callback = None

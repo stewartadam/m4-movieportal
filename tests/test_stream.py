@@ -1,6 +1,7 @@
 """Tests for the host-side movie streamer."""
 
 from fractions import Fraction
+from io import StringIO
 from pathlib import Path
 import queue
 import struct
@@ -89,6 +90,10 @@ class StreamTests(unittest.TestCase):
             "force_original_aspect_ratio=decrease",
             command[command.index("-vf") + 1],
         )
+        self.assertIn(
+            "pow(val/255,2.2)*255",
+            command[command.index("-vf") + 1],
+        )
         self.assertTrue(command[command.index("-vf") + 1].endswith(",hflip,vflip"))
         self.assertEqual(command[-1], "pipe:1")
 
@@ -127,6 +132,17 @@ class StreamTests(unittest.TestCase):
     @patch("stream.DISPLAY_ROTATION", 0)
     def test_filter_can_leave_frames_unrotated(self):
         self.assertNotIn("hflip", stream.build_video_filter("letterbox"))
+
+    def test_filter_can_disable_led_gamma_correction(self):
+        video_filter = stream.build_video_filter("letterbox", led_gamma=1)
+
+        self.assertNotIn("lutrgb", video_filter)
+
+    def test_filter_rejects_invalid_led_gamma(self):
+        for gamma in (0, -1, float("nan"), float("inf")):
+            with self.subTest(gamma=gamma):
+                with self.assertRaisesRegex(ValueError, "LED gamma"):
+                    stream.build_video_filter("letterbox", led_gamma=gamma)
 
     @patch("stream.DISPLAY_ROTATION", 90)
     def test_filter_rejects_unsupported_rotation(self):
@@ -246,6 +262,33 @@ class StreamTests(unittest.TestCase):
         args = stream.create_parser().parse_args(["iina"])
 
         self.assertEqual(args.socket, stream.DEFAULT_IINA_SOCKET)
+        self.assertEqual(args.led_gamma, stream.DEFAULT_LED_GAMMA)
+
+    def test_iina_waits_for_a_movie_to_open(self):
+        class OpeningIpc(self.FakeIpc):
+            def __init__(self):
+                super().__init__()
+                self.properties["path"] = None
+
+            def next_event(self, timeout=None):
+                event = super().next_event(timeout=None)
+                if event is None and timeout is not None:
+                    self.properties["path"] = "/tmp/new-movie.mkv"
+                    return {"event": "start-file"}
+                return event
+
+        ipc = OpeningIpc()
+        control = stream.IinaPlaybackControl(ipc)
+        stderr = StringIO()
+
+        with patch("stream.sys.stderr", stderr):
+            control.wait_until_playing()
+
+        self.assertEqual(ipc.properties["path"], "/tmp/new-movie.mkv")
+        self.assertEqual(
+            stderr.getvalue(),
+            "IINA has no open movie; waiting for playback.\n",
+        )
 
     def test_iina_seek_holds_the_player_for_a_restart(self):
         ipc = self.FakeIpc()
@@ -268,17 +311,60 @@ class StreamTests(unittest.TestCase):
         self.assertTrue(control.sync_held)
         self.assertTrue(control.resume_after_sync)
 
+    def test_iina_coalesces_queued_seeks_before_restarting(self):
+        ipc = self.FakeIpc()
+        control = stream.IinaPlaybackControl(ipc)
+        control.wait_until_playing()
+        ipc.get_property = MagicMock(side_effect=ipc.get_property)
+        for _ in range(3):
+            ipc.events.put({"event": "seek"})
+
+        with self.assertRaises(stream.PlaybackInterrupted):
+            control.poll()
+
+        control.poll()
+        self.assertTrue(ipc.events.empty())
+        ipc.get_property.assert_called_once_with("pause")
+
     def test_iina_seek_while_paused_requests_a_still_preview(self):
         ipc = self.FakeIpc()
         ipc.properties["pause"] = True
         control = stream.IinaPlaybackControl(ipc)
-        ipc.events.put({"event": "seek"})
+        for _ in range(3):
+            ipc.events.put({"event": "seek"})
 
         with self.assertRaises(stream.PausedSeekRequested):
             control.wait_until_playing()
 
         self.assertFalse(control.sync_held)
         self.assertTrue(ipc.properties["pause"])
+        self.assertTrue(ipc.events.empty())
+
+    def test_iina_initial_pause_requests_one_still_preview(self):
+        class ResumingIpc(self.FakeIpc):
+            def __init__(self):
+                super().__init__()
+                self.properties["pause"] = True
+
+            def next_event(self, timeout=None):
+                event = super().next_event(timeout=None)
+                if event is None and timeout is not None:
+                    self.properties["pause"] = False
+                    return {
+                        "event": "property-change",
+                        "name": "pause",
+                        "data": False,
+                    }
+                return event
+
+        ipc = ResumingIpc()
+        control = stream.IinaPlaybackControl(ipc)
+
+        with self.assertRaises(stream.PausedSeekRequested):
+            control.wait_until_playing()
+
+        control.wait_until_playing()
+        self.assertFalse(ipc.properties["pause"])
 
     @patch("stream.read_exact", side_effect=KeyboardInterrupt)
     @patch("stream.subprocess.Popen")

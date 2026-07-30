@@ -11,3 +11,5 @@
 - Present a one-frame MatrixPortal preview when seeking while IINA is paused.
 - Increase HUB75 output depth to 5 bits per channel (32,768 displayed colors).
 - Add a `DISPLAY_ROTATION` setting for host-rendered movie and test frames.
+- Linearize gamma-encoded SDR video for the HUB75 panel's LED output.
+- Display IINA's current playhead frame when starting or becoming paused.
