@@ -1,0 +1,54 @@
+# Big Lebowski shadow, skin-tone, and dark-scene regression frames.
+fit = "letterbox"
+timestamps = [
+    887.261, # 14:47 - face should be peach colored not bright red or hitting the dark floor
+    1583.79, # 26:24 - eyes and beard are red instead of near-black or brown
+    3949.07, # 1:05:49 - driving
+    4852.598, # 1:20:53 - greyscale, make sure no color noise is present
+    5035.655, # 1:23:56 - nearly black, with faint blue and white headlights
+    5043.33, # 1:24:03 - dude outline should retain its warm tone
+    6404.94, # 1:46:45 - end of movie
+]
+
+[[variant]]
+name = "g2.2 DF0 NQ"
+led_gamma = 2.2
+led_dark_floor = 0
+rgb5_quantizer = false
+
+[[variant]]
+name = "g1.6 DF0 NQ"
+led_gamma = 1.6
+led_dark_floor = 0
+rgb5_quantizer = false
+
+[[variant]]
+name = "g1.4 DF0 Q"
+led_gamma = 1.4
+led_dark_floor = 0
+rgb5_quantizer = true
+
+[[variant]]
+name = "g1.4 DF0 NQ"
+led_gamma = 1.4
+led_dark_floor = 1
+rgb5_quantizer = true
+
+[[variant]]
+name = "g2.2 DF0 Q"
+led_gamma = 2.2
+led_dark_floor = 0
+rgb5_quantizer = true
+
+[[variant]]
+name = "BT709 DF0 NQ"
+led_gamma = "bt709"
+led_dark_floor = 0
+rgb5_quantizer = false
+
+[[variant]]
+name = "BT709 DF0 Q (default)"
+led_gamma = "bt709"
+led_dark_floor = 0
+led_shadow_red_bias = 0.5
+rgb5_quantizer = true

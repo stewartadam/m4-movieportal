@@ -12,8 +12,10 @@ frames. This keeps the working set bounded and supports movies of arbitrary
 length despite the board's 192 KB SRAM and 2 MB flash.
 
 The USB framebuffer is RGB565, while the HUB75 scan driver currently uses
-5 bits per color channel for 32,768 simultaneously displayed colors. Host frames
-are rotated according to `DISPLAY_ROTATION` in `settings.py` before
+5 bits per color channel for 32,768 simultaneously displayed colors. At this
+depth Protomatter discards the RGB565 green least-significant bit, so the host
+quantizer targets the panel's effective RGB555 palette and emits even green
+codes. Host frames are rotated according to `DISPLAY_ROTATION` in `settings.py` before
 transmission; supported values are `0` and `180`.
 
 This is an initial USB prototype. Direct-mode pause/seek controls, HDR tone
@@ -59,6 +61,8 @@ any libraries from the CircuitPython bundle.
 
 6. Connect the MatrixPortal and edit `DISPLAY_ROTATION` in `settings.py` to
    match the physical panel orientation. Supported values are `0` and `180`.
+   Keep `DISPLAY_BIT_DEPTH` aligned with the host mapper; the supported value
+   is currently `5`.
 
 7. Install the device code:
 
@@ -119,20 +123,32 @@ Useful options include `--fit crop`, `--duration 5`, `--hwaccel none`,
 The audio delay defaults to the same 250 ms preroll used by the device; adjust
 it if the computer's audio device adds noticeable latency.
 
-MoviePortal applies a 2.2 gamma exponent by default before RGB565 quantization
-so gamma-encoded SDR video drives the panel's linear LED output correctly.
-Adjust `--led-gamma` for a particular panel, or use `--led-gamma 1` to disable
-the correction. `--no-led-gamma` is the equivalent explicit on/off control.
-Area scaling and gamma conversion use 16-bit working precision
-so small, dark details are not discarded before quantization. MoviePortal then
-uses stable five-bit output levels. In shadows, it quantizes luminance once
-and adds reduced chroma residuals, producing muted colors without independent
-red/green/blue sparkle. The host packs RGB565 itself so FFmpeg cannot introduce
+MoviePortal applies the inverse BT.709 transfer by default before RGB565
+quantization so BT.709 SDR video drives the panel's linear LED output
+correctly. Unlike a pure 2.2 power curve, BT.709 has a linear shadow segment
+that does not exaggerate small channel differences into saturated red, teal,
+or yellow pixels. `--led-gamma EXPONENT` selects an explicit power curve;
+`--led-gamma bt709` selects the default curve, while `--led-gamma 1` and
+`--no-led-gamma` disable transfer correction.
+Area scaling, transfer conversion, and the FFmpeg-to-host handoff use 16-bit
+working precision so small, dark details are not discarded before
+quantization. MoviePortal then selects RGB565 values on the host. In shadows,
+it median-filters chroma over a 3x3 neighborhood and neutralizes only locally
+neutral color noise. Lit frames that are globally neutral use a stronger local
+threshold to remove clustered color grain; nearly black scenes keep the normal
+threshold so sparse blue or warm details survive. Coherent warm and cool
+regions retain their color, and the quantizer no longer inserts a minimum gray
+level. Packing RGB565 on the host also prevents FFmpeg from introducing
 colored ordered dithering while reducing the final channel depths.
-`--led-dark-floor LEVEL` adjusts a fine-grained
-luminance cutoff within the first five-bit output step. The default 0 is the
-weakest cutoff; levels 1, 2, and above progressively suppress near-black noise
-without discarding every first-step shadow pixel at once.
+The lowest red codes are especially conspicuous on the panel, so red-dominant
+shadow pixels use a slightly higher red rounding threshold. This removes
+marginal red codes without changing the transfer curve, neutral grays,
+blue-dominant shadows, or brighter colors. `--led-shadow-red-bias BIAS`
+controls the extra threshold in five-bit code units from 0 to 1; the default
+is 0.5 and 0 disables the correction.
+`--led-dark-floor LEVEL` applies a luminance cutoff before quantization in
+eighths of the first five-bit output step. Level 0 disables the cutoff; levels
+1, 2, and above progressively suppress near-black noise.
 `--no-led-dark-floor` selects level 0.
 
 Each non-scaling stage can be compared independently: use `--no-led-gamma` to
@@ -153,7 +169,8 @@ frames are enlarged with nearest-neighbor scaling so individual output pixels
 remain visible. Display rotation is normalized in the PNG so all three columns
 have the source orientation. Pass options such as `--fit crop`,
 `--led-gamma 2.4`, `--no-led-gamma`, `--led-dark-floor 2`, or
-`--no-rgb5-quantizer` after the timestamps to adjust the post-processed column.
+`--led-shadow-red-bias 0.25`, or `--no-rgb5-quantizer` after the timestamps to
+adjust the post-processed column.
 
 For multiple named post-processing variants, use a TOML config:
 
@@ -163,9 +180,18 @@ just compare "/path/to/movie.mkv" comparison.png 10 01:15.5 300 \
 ```
 
 The config's `[[variant]]` entries become additional labeled columns after the
-source and scaled-source columns. Copy `comparison.example.toml` when creating
-a new comparison set; each variant can set `led_gamma`, `led_dark_floor`, and
+source and scaled-source columns. `timestamps` may also live in the config;
+command-line timestamps override them. Copy `comparison.example.toml` when
+creating a new comparison set; `comparison.big-lebowski.toml` contains the
+timestamps and variants used for the supplied regression frames. Each variant
+can set `led_gamma`, `led_dark_floor`, `led_shadow_red_bias`, and
 `rgb5_quantizer` independently.
+Every processed comparison cell uses the same `stream.ffmpeg_frames()` RGB48
+decode, transfer controls, host-side RGB565 packer, and rotation as live
+playback. The comparison layer then applies the same five-bit scan-driver
+decimation to the exact transmitted RGB565 bytes and encodes the resulting LED
+light for viewing on a monitor. Use `--fps` if the live stream uses a
+non-default frame rate.
 
 The global `--port /dev/cu.usbmodem...` and `--fps 15` options must precede
 `play` when invoking `stream.py` directly. For example:
@@ -204,6 +230,7 @@ Use `just stream -- --port /dev/cu.usbmodem... iina` to select the data port
 explicitly. The `iina` command also accepts `--fit crop`, `--hwaccel none`,
 `--led-gamma VALUE`, `--no-led-gamma`, `--rgb5-quantizer`,
 `--no-rgb5-quantizer`, `--led-dark-floor LEVEL`, `--no-led-dark-floor`,
+`--led-shadow-red-bias BIAS`,
 `--scaled-source`, and `--socket PATH`. For example, compare cutoff levels or
 the scaled source without having to repeat the default IINA socket:
 
@@ -211,6 +238,25 @@ the scaled source without having to repeat the default IINA socket:
 just iina --led-dark-floor 0
 just iina --led-dark-floor 2
 just iina --scaled-source
+```
+
+To automatically seek IINA through the timestamps in the comparison config,
+run:
+
+```sh
+just iina-seek
+```
+
+The script seeks exactly to each timestamp and pauses for three seconds before
+moving on. By default it reads `comparison.big-lebowski.toml`; provide any TOML
+or `.config` file containing a non-empty `timestamps = [...]` array with
+`--config`. Use `--dwell SECONDS` to change the pause, `--loop` to repeat the
+sequence, or `--socket PATH` when IINA uses a different IPC socket:
+
+```sh
+just iina-seek --dwell 5
+just iina-seek --loop
+just iina-seek --config my-movie.config
 ```
 
 To open the CircuitPython console or data port with

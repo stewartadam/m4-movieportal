@@ -10,7 +10,7 @@ test:
 
 # Compile the host/device sources and run their tests.
 check:
-    uv run python -m compileall -q boot.py code.py compare.py movieportal.py mpv_ipc.py protocol.py settings.py stream.py tests
+    uv run python -m compileall -q boot.py code.py compare.py iina_seek.py movieportal.py mpv_ipc.py protocol.py settings.py stream.py tests
     uv run python -m unittest discover -s tests
 
 # Install the CircuitPython runtime on a mounted board.
@@ -29,6 +29,10 @@ play source *args:
 # Follow the open movie and playback controls in IINA.
 iina *args:
     uv run --script stream.py iina --socket /tmp/m4-movieportal-mpv.sock {{args}}
+
+# Seek IINA through the movie's visual regression checkpoints.
+iina-seek *args:
+    uv run iina_seek.py {{args}}
 
 # Render source, scaled-source, and post-processed columns at each timestamp.
 compare source output *args:

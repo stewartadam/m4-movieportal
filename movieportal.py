@@ -5,13 +5,13 @@ import struct
 import time
 
 import protocol
+from settings import DISPLAY_BIT_DEPTH
 
 
 WIDTH = 64
 HEIGHT = 32
 FRAME_SIZE = WIDTH * HEIGHT * 2
 QUEUE_CAPACITY = 4
-BIT_DEPTH = 5
 START_DELAY_SECONDS = protocol.PREROLL_MS / 1000.0
 CONTROL_PAYLOAD_SIZE = protocol.STATUS_SIZE
 
@@ -251,7 +251,7 @@ def _create_matrix():
     return rgbmatrix.RGBMatrix(
         width=WIDTH,
         height=HEIGHT,
-        bit_depth=BIT_DEPTH,
+        bit_depth=DISPLAY_BIT_DEPTH,
         addr_pins=board.MTX_ADDRESS[:4],
         doublebuffer=True,
         **board.MTX_COMMON,

@@ -17,6 +17,20 @@
   avoid spurious primary-color dots without erasing muted colors.
 - Pack RGB565 deterministically on the host to prevent FFmpeg's final
   pixel-format conversion from reintroducing colored ordered dithering.
+- Keep the decoder handoff at RGB48 and use frame-aware RGB565 shadow colors,
+  retaining real warm tones without adding color sparkle to neutral scenes.
+- Render comparison cells through the live frame pipeline and preview the exact
+  transmitted RGB565 values with inverse LED gamma.
+- Model Protomatter's five-bit scan output: emit even RGB565 green codes and
+  discard the unused green bit in comparison previews.
+- Use the tagged BT.709 SDR transfer by default instead of a pure 2.2 power
+  approximation, preserving channel balance in deep shadows.
+- Replace the shared-luminance shadow lift with local 3x3 chroma cleanup so
+  neutral noise is suppressed without painting colored scenes gray or orange.
+- Strengthen local chroma cleanup adaptively for lit neutral scenes while
+  preserving sparse color in nearly black frames.
+- Bias only red-dominant shadow quantization away from marginal red codes,
+  retaining BT.709 contrast and exposing the correction as a tuning control.
 - Make gamma correction and the custom five-bit quantizer independently
   switchable, with a scaled-source comparison mode that bypasses both.
 - Add a comparison PNG command that lays out source, scaled-source, and

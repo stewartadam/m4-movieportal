@@ -74,7 +74,10 @@ class StreamTests(unittest.TestCase):
         )
 
     @patch("stream.shutil.which", return_value="/opt/bin/ffmpeg")
-    def test_ffmpeg_uses_auto_hardware_decode_and_stable_rgb24(self, _which):
+    def test_ffmpeg_leaves_rgb5_quantization_to_stable_host_packer(
+        self,
+        _which,
+    ):
         command = stream.build_ffmpeg_command(
             Path("/tmp/movie.mkv"),
             Fraction(24, 1),
@@ -85,24 +88,17 @@ class StreamTests(unittest.TestCase):
 
         self.assertIn("-hwaccel", command)
         self.assertEqual(command[command.index("-hwaccel") + 1], "auto")
-        self.assertEqual(command[command.index("-pix_fmt") + 1], "rgb24")
+        self.assertEqual(command[command.index("-pix_fmt") + 1], "rgb48le")
         self.assertIn(
             "force_original_aspect_ratio=decrease",
             command[command.index("-vf") + 1],
         )
         self.assertIn(
-            "pow(val/maxval,2.2)*maxval",
-            command[command.index("-vf") + 1],
-        )
-        self.assertIn(
-            "0.2126*r(X,Y)+0.7152*g(X,Y)+0.0722*b(X,Y)",
-            command[command.index("-vf") + 1],
-        )
-        self.assertIn(
-            "ceil(((r(X,Y)-",
+            "if(lt(val/maxval,0.081)",
             command[command.index("-vf") + 1],
         )
         video_filter = command[command.index("-vf") + 1]
+        self.assertNotIn("geq=", video_filter)
         self.assertLess(
             video_filter.index("format=gbrp16le"),
             video_filter.index("scale=64:32"),
@@ -112,8 +108,8 @@ class StreamTests(unittest.TestCase):
             video_filter.index("lutrgb"),
         )
         self.assertLess(
-            video_filter.index("geq="),
-            video_filter.index("format=rgb24"),
+            video_filter.index("lutrgb"),
+            video_filter.index("format=rgb48le"),
         )
         self.assertTrue(command[command.index("-vf") + 1].endswith(",hflip,vflip"))
         self.assertEqual(command[-1], "pipe:1")
@@ -158,12 +154,11 @@ class StreamTests(unittest.TestCase):
         video_filter = stream.build_video_filter("letterbox", led_gamma=1)
 
         self.assertNotIn("lutrgb", video_filter)
-        self.assertIn("geq", video_filter)
 
-    def test_filter_can_disable_custom_rgb5_quantizer(self):
+    def test_filter_leaves_custom_quantization_to_the_host(self):
         video_filter = stream.build_video_filter(
             "letterbox",
-            rgb5_quantizer=False,
+            rgb5_quantizer=True,
         )
 
         self.assertIn("lutrgb", video_filter)
@@ -182,29 +177,15 @@ class StreamTests(unittest.TestCase):
         self.assertNotIn("geq", video_filter)
         self.assertTrue(video_filter.endswith(",hflip,vflip"))
 
-    def test_filter_uses_the_weakest_led_dark_floor_at_zero(self):
-        levels = stream.build_rgb5_levels(0)
+    def test_filter_uses_bt709_transfer_by_default(self):
+        video_filter = stream.build_video_filter("letterbox")
 
-        self.assertIn(
-            "*31*64,65535*1)",
-            levels["r"],
-        )
-        self.assertEqual(
-            stream.build_rgb5_quantizer("r", levels),
-            "{}*65535/31".format(levels["r"]),
-        )
+        self.assertIn("(val/maxval)/4.5", video_filter)
+        self.assertIn("1/0.45", video_filter)
 
-    def test_led_dark_floor_moves_the_substep_luma_cutoff(self):
-        level_zero = stream.build_rgb5_levels(0)
-        level_two = stream.build_rgb5_levels(2)
-
-        self.assertIn("*31*64,65535*1)", level_zero["r"])
-        self.assertIn("*31*64,65535*3)", level_two["r"])
-
-    def test_shadows_use_reduced_correlated_chroma(self):
-        levels = stream.build_rgb5_levels()
-
-        self.assertIn("*31/65535/2)", levels["r"])
+    def test_parses_bt709_or_numeric_led_transfer(self):
+        self.assertEqual(stream.parse_led_gamma("bt709"), "bt709")
+        self.assertEqual(stream.parse_led_gamma("1.8"), 1.8)
 
     def test_filter_rejects_invalid_led_gamma(self):
         for gamma in (0, -1, float("nan"), float("inf")):
@@ -288,6 +269,170 @@ class StreamTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "RGB24 frame"):
             stream.pack_rgb565(bytes(stream.RGB24_FRAME_SIZE - 1))
 
+    def test_rgb48_packing_targets_five_visible_bits_per_channel(self):
+        pixel = struct.pack("<HHH", 0, 32768, 0)
+        rgb48 = pixel * (stream.WIDTH * stream.HEIGHT)
+
+        frame = stream.pack_rgb565_48(rgb48)
+        packed_pixel = frame[0] | frame[1] << 8
+
+        self.assertEqual((packed_pixel >> 5) & 63, 32)
+
+    def test_led_packer_balances_red_dominant_shadow_chroma(self):
+        rgb24 = bytes((16, 7, 3)) * (stream.WIDTH * stream.HEIGHT)
+
+        frame = stream.pack_led_rgb565(rgb24)
+        pixel = frame[0] | frame[1] << 8
+
+        self.assertEqual(
+            ((pixel >> 11) & 31, (pixel >> 5) & 63, pixel & 31),
+            (1, 2, 0),
+        )
+
+    def test_led_packer_can_disable_shadow_red_rounding_bias(self):
+        red_source = round((0.7 / stream.RGB5_MAX) * 65535)
+        green_source = round((0.4 / stream.RGB5_MAX) * 65535)
+        blue_source = round((0.2 / stream.RGB5_MAX) * 65535)
+        pixel = struct.pack("<HHH", red_source, green_source, blue_source)
+        rgb48 = pixel * (stream.WIDTH * stream.HEIGHT)
+
+        balanced = stream.pack_led_rgb565(
+            rgb48,
+            channel_max=65535,
+        )
+        unbiased = stream.pack_led_rgb565(
+            rgb48,
+            channel_max=65535,
+            shadow_red_bias=0,
+        )
+
+        self.assertEqual(balanced[:2], bytes(2))
+        self.assertEqual(
+            ((unbiased[1] << 8 | unbiased[0]) >> 11) & 31,
+            1,
+        )
+
+    def test_led_packer_does_not_bias_non_red_or_bright_pixels(self):
+        for pixel in (bytes((3, 7, 16)), bytes((48, 16, 8))):
+            with self.subTest(pixel=pixel):
+                rgb24 = pixel * (stream.WIDTH * stream.HEIGHT)
+                balanced = stream.pack_led_rgb565(rgb24)
+                unbiased = stream.pack_led_rgb565(
+                    rgb24,
+                    shadow_red_bias=0,
+                )
+
+                self.assertEqual(balanced, unbiased)
+
+    def test_led_packer_keeps_neutral_frame_free_of_color_outlier(self):
+        rgb24 = bytearray(
+            bytes((8, 8, 8)) * (stream.WIDTH * stream.HEIGHT)
+        )
+        rgb24[:3] = bytes((16, 7, 3))
+
+        frame = stream.pack_led_rgb565(rgb24)
+        pixel = frame[0] | frame[1] << 8
+
+        self.assertEqual(
+            ((pixel >> 11) & 31, (pixel >> 5) & 63, pixel & 31),
+            (1, 2, 1),
+        )
+
+    def test_led_packer_removes_clustered_chroma_grain_from_neutral_frame(self):
+        rgb24 = bytearray(
+            bytes((8, 8, 8)) * (stream.WIDTH * stream.HEIGHT)
+        )
+        for y in range(4):
+            for x in range(4):
+                offset = (y * stream.WIDTH + x) * 3
+                rgb24[offset : offset + 3] = bytes((12, 8, 8))
+
+        frame = stream.pack_led_rgb565(rgb24)
+        pixel = frame[0] | frame[1] << 8
+
+        self.assertEqual(
+            ((pixel >> 11) & 31, (pixel >> 5) & 63, pixel & 31),
+            (1, 2, 1),
+        )
+
+    def test_led_packer_preserves_sparse_coherent_blue_in_dark_frame(self):
+        rgb24 = bytearray(stream.RGB24_FRAME_SIZE)
+        for y in range(3):
+            for x in range(3):
+                offset = (y * stream.WIDTH + x) * 3
+                rgb24[offset : offset + 3] = bytes((0, 0, 5))
+
+        frame = stream.pack_led_rgb565(rgb24)
+        pixel = frame[0] | frame[1] << 8
+
+        self.assertEqual(
+            ((pixel >> 11) & 31, (pixel >> 5) & 63, pixel & 31),
+            (0, 0, 1),
+        )
+
+    def test_led_packer_only_emits_green_codes_visible_at_five_bit_depth(self):
+        rgb24 = bytes(range(256)) * (
+            stream.RGB24_FRAME_SIZE // 256
+        )
+
+        frame = stream.pack_led_rgb565(rgb24)
+        pixels = struct.iter_unpack("<H", frame)
+
+        self.assertTrue(
+            all(((pixel[0] >> 5) & 63) % 2 == 0 for pixel in pixels)
+        )
+
+    def test_led_packer_does_not_artificially_lift_sub_code_shadow_signal(self):
+        pixel = struct.pack("<HHH", 100, 100, 100)
+        rgb48 = pixel * (stream.WIDTH * stream.HEIGHT)
+
+        frame = stream.pack_led_rgb565(rgb48, channel_max=65535)
+        packed_pixel = frame[0] | frame[1] << 8
+
+        self.assertEqual(
+            (
+                (packed_pixel >> 11) & 31,
+                (packed_pixel >> 5) & 63,
+                packed_pixel & 31,
+            ),
+            (0, 0, 0),
+        )
+
+    def test_led_dark_floor_suppresses_shadow_before_quantization(self):
+        red_source = round((0.6 / stream.RGB5_MAX) * 65535)
+        pixel = struct.pack("<HHH", red_source, 0, 0)
+        rgb48 = pixel * (stream.WIDTH * stream.HEIGHT)
+
+        no_floor = stream.pack_led_rgb565(
+            rgb48,
+            dark_floor=0,
+            channel_max=65535,
+            shadow_red_bias=0,
+        )
+        floor_two = stream.pack_led_rgb565(
+            rgb48,
+            dark_floor=2,
+            channel_max=65535,
+            shadow_red_bias=0,
+        )
+
+        self.assertNotEqual(no_floor[:2], bytes(2))
+        self.assertEqual(floor_two[:2], bytes(2))
+
+    def test_led_packer_rejects_invalid_input(self):
+        with self.assertRaisesRegex(ValueError, "RGB frame"):
+            stream.pack_led_rgb565(bytes(stream.RGB24_FRAME_SIZE - 1))
+        with self.assertRaisesRegex(ValueError, "dark floor"):
+            stream.pack_led_rgb565(
+                bytes(stream.RGB24_FRAME_SIZE),
+                dark_floor=32,
+            )
+        with self.assertRaisesRegex(ValueError, "red bias"):
+            stream.pack_led_rgb565(
+                bytes(stream.RGB24_FRAME_SIZE),
+                shadow_red_bias=1.1,
+            )
+
     def test_interrupted_stream_consumes_the_stop_response(self):
         class CloseableFrames:
             def __init__(self):
@@ -357,6 +502,10 @@ class StreamTests(unittest.TestCase):
             args.led_dark_floor,
             stream.DEFAULT_LED_DARK_FLOOR,
         )
+        self.assertEqual(
+            args.led_shadow_red_bias,
+            stream.DEFAULT_LED_SHADOW_RED_BIAS,
+        )
 
     def test_iina_command_can_disable_each_preprocessing_stage(self):
         args = stream.create_parser().parse_args(
@@ -388,6 +537,13 @@ class StreamTests(unittest.TestCase):
         )
 
         self.assertEqual(args.led_dark_floor, 3)
+
+    def test_iina_command_can_set_shadow_red_bias(self):
+        args = stream.create_parser().parse_args(
+            ["iina", "--led-shadow-red-bias", "0.25"]
+        )
+
+        self.assertEqual(args.led_shadow_red_bias, 0.25)
 
     def test_iina_waits_for_a_movie_to_open(self):
         class OpeningIpc(self.FakeIpc):

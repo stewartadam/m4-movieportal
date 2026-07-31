@@ -3,18 +3,21 @@ fit = "letterbox"
 
 [[variant]]
 name = "default"
-led_gamma = 2.2
+led_gamma = "bt709"
 led_dark_floor = 0
+led_shadow_red_bias = 0.5
 rgb5_quantizer = true
 
 [[variant]]
 name = "no gamma"
 led_gamma = 1
 led_dark_floor = 0
+led_shadow_red_bias = 0.5
 rgb5_quantizer = true
 
 [[variant]]
 name = "no quantizer"
-led_gamma = 2.2
+led_gamma = "bt709"
 led_dark_floor = 0
+led_shadow_red_bias = 0
 rgb5_quantizer = false

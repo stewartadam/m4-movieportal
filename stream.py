@@ -11,6 +11,7 @@ import math
 from pathlib import Path
 import queue
 import shutil
+import statistics
 import struct
 import subprocess
 import sys
@@ -19,23 +20,30 @@ import time
 
 from mpv_ipc import MpvIpcClient, MpvIpcError
 import protocol
-from settings import DISPLAY_ROTATION
+from settings import DISPLAY_BIT_DEPTH, DISPLAY_ROTATION
 
 
 WIDTH = 64
 HEIGHT = 32
 FRAME_SIZE = WIDTH * HEIGHT * 2
 RGB24_FRAME_SIZE = WIDTH * HEIGHT * 3
+RGB48_FRAME_SIZE = WIDTH * HEIGHT * 6
 DEFAULT_FPS = Fraction(24, 1)
 PREBUFFER_FRAMES = 3
 DEFAULT_IINA_SOCKET = "/tmp/m4-movieportal-mpv.sock"
-DEFAULT_LED_GAMMA = 2.2
+DEFAULT_LED_GAMMA = "bt709"
 RGB5_MAX = 31
-RGB_WORK_MAX = 65535
 DEFAULT_LED_DARK_FLOOR = 0
+DEFAULT_LED_SHADOW_RED_BIAS = 0.5
 SHADOW_CHROMA_MAX_LEVEL = 4
-SHADOW_CHROMA_DIVISOR = 2
-DARK_FLOOR_SUBSTEPS = 64
+DARK_FLOOR_SUBSTEPS = 8
+LOCAL_NEUTRAL_CHROMA_THRESHOLD = 0.35
+NEUTRAL_FRAME_CHROMA_THRESHOLD = 0.35
+NEUTRAL_FRAME_LUMA_THRESHOLD = 0.5
+NEUTRAL_FRAME_LOCAL_CHROMA_THRESHOLD = 0.7
+
+if DISPLAY_BIT_DEPTH != 5:
+    raise RuntimeError("host color mapping currently requires 5-bit panel output")
 
 
 def parse_frame_rate(value):
@@ -50,13 +58,19 @@ def parse_frame_rate(value):
 
 
 def parse_led_gamma(value):
-    """Parse a positive, finite LED gamma exponent."""
+    """Parse the BT.709 transfer name or a positive gamma exponent."""
+    if str(value).lower() == "bt709":
+        return "bt709"
     try:
         gamma = float(value)
     except ValueError as error:
-        raise argparse.ArgumentTypeError("LED gamma must be a number") from error
+        raise argparse.ArgumentTypeError(
+            "LED gamma must be bt709 or a number"
+        ) from error
     if not math.isfinite(gamma) or gamma <= 0:
-        raise argparse.ArgumentTypeError("LED gamma must be positive and finite")
+        raise argparse.ArgumentTypeError(
+            "LED gamma must be bt709 or positive and finite"
+        )
     return gamma
 
 
@@ -75,69 +89,19 @@ def parse_led_dark_floor(value):
     return level
 
 
-def build_rgb5_levels(dark_floor=DEFAULT_LED_DARK_FLOOR):
-    """Build stable five-bit levels with correlated shadow chroma."""
-    rounded = {
-        component: "floor({}(X,Y)*{}/{}+0.5)".format(
-            component,
-            RGB5_MAX,
-            RGB_WORK_MAX,
+def parse_led_shadow_red_bias(value):
+    """Parse the red rounding bias applied in RGB5 shadows."""
+    try:
+        bias = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "LED shadow red bias must be a number"
+        ) from error
+    if not math.isfinite(bias) or not 0 <= bias <= 1:
+        raise argparse.ArgumentTypeError(
+            "LED shadow red bias must be between 0 and 1"
         )
-        for component in "rgb"
-    }
-    peak_level = "max(max({r},{g}),{b})".format(**rounded)
-    luma = "(0.2126*r(X,Y)+0.7152*g(X,Y)+0.0722*b(X,Y))"
-    rounded_luma = (
-        "floor((0.2126*r(X,Y)+0.7152*g(X,Y)+0.0722*b(X,Y))"
-        "*{}/{}+0.5)".format(RGB5_MAX, RGB_WORK_MAX)
-    )
-    luma_signal = "gte({}*{}*{},{}*{})".format(
-        luma,
-        RGB5_MAX,
-        DARK_FLOOR_SUBSTEPS,
-        RGB_WORK_MAX,
-        dark_floor + 1,
-    )
-    luma_level = "if({},max({},1),{})".format(
-        luma_signal,
-        rounded_luma,
-        rounded_luma,
-    )
-    levels = {}
-    for component in "rgb":
-        chroma = "(({}(X,Y)-{})*{}/{}/{})".format(
-            component,
-            luma,
-            RGB5_MAX,
-            RGB_WORK_MAX,
-            SHADOW_CHROMA_DIVISOR,
-        )
-        chroma_level = (
-            "if(gte({chroma},0),"
-            "floor({chroma}+0.5),ceil({chroma}-0.5))"
-        ).format(chroma=chroma)
-        shadow_level = "clip({}+{},0,{})".format(
-            luma_level,
-            chroma_level,
-            RGB5_MAX,
-        )
-        levels[component] = "if(lte({},{}),{},{})".format(
-            peak_level,
-            SHADOW_CHROMA_MAX_LEVEL,
-            shadow_level,
-            rounded[component],
-        )
-
-    return levels
-
-
-def build_rgb5_quantizer(component, levels):
-    """Build a stable five-bit quantizer for one RGB component."""
-    return "{}*{}/{}".format(
-        levels[component],
-        RGB_WORK_MAX,
-        RGB5_MAX,
-    )
+    return bias
 
 
 def build_video_filter(
@@ -146,10 +110,15 @@ def build_video_filter(
     led_dark_floor=DEFAULT_LED_DARK_FLOOR,
     rgb5_quantizer=True,
     scaled_source=False,
+    output_format="rgb24",
 ):
     """Build the 64x32 scale/crop and LED transfer filter graph."""
-    if not math.isfinite(led_gamma) or led_gamma <= 0:
-        raise ValueError("LED gamma must be positive and finite")
+    if led_gamma != "bt709" and (
+        not isinstance(led_gamma, (int, float))
+        or not math.isfinite(led_gamma)
+        or led_gamma <= 0
+    ):
+        raise ValueError("LED gamma must be bt709 or positive and finite")
     if (
         not isinstance(led_dark_floor, int)
         or not 0 <= led_dark_floor <= RGB5_MAX
@@ -175,22 +144,26 @@ def build_video_filter(
             "scale=64:32:force_original_aspect_ratio=decrease:flags=area,"
             "pad=64:32:(ow-iw)/2:(oh-ih)/2:color=black"
         )
-    if led_gamma != 1:
+    if led_gamma == "bt709":
+        expression = (
+            "if(lt(val/maxval,0.081),"
+            "(val/maxval)/4.5,"
+            "pow(((val/maxval)+0.099)/1.099,1/0.45))*maxval"
+        )
+        filters += (
+            ",lutrgb=r='{expression}':g='{expression}':b='{expression}'"
+        ).format(expression=expression)
+    elif led_gamma != 1:
         gamma = "{:g}".format(led_gamma)
         expression = "pow(val/maxval,{})*maxval".format(gamma)
         filters += (
             ",lutrgb=r='{expression}':g='{expression}':b='{expression}'"
         ).format(expression=expression)
-    if rgb5_quantizer:
-        levels = build_rgb5_levels(led_dark_floor)
-        expressions = {
-            component: build_rgb5_quantizer(component, levels)
-            for component in "rgb"
-        }
-        filters += ",geq=r='{r}':g='{g}':b='{b}':i=nearest".format(
-            **expressions
-        )
-    filters += ",format=rgb24"
+    # The custom quantizer needs spatial context and runs on the RGB48 frame
+    # in pack_led_rgb565(), after this decoder filter.
+    if output_format not in ("rgb24", "rgb48le"):
+        raise ValueError("output format must be rgb24 or rgb48le")
+    filters += ",format={}".format(output_format)
     if DISPLAY_ROTATION == 180:
         filters += ",hflip,vflip"
     elif DISPLAY_ROTATION != 0:
@@ -211,7 +184,7 @@ def build_ffmpeg_command(
     rgb5_quantizer=True,
     scaled_source=False,
 ):
-    """Build an FFmpeg RGB24 command for deterministic host-side packing."""
+    """Build an FFmpeg RGB48 command for deterministic host-side packing."""
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RuntimeError("ffmpeg was not found in PATH")
@@ -236,11 +209,12 @@ def build_ffmpeg_command(
                 fit,
                 led_gamma,
                 led_dark_floor,
-                rgb5_quantizer,
+                False,
                 scaled_source,
+                "rgb48le",
             ).format(fps=fps_text),
             "-pix_fmt",
-            "rgb24",
+            "rgb48le",
         ]
     )
     if max_frames is not None:
@@ -271,7 +245,7 @@ def read_exact(stream, size):
 
 
 def pack_rgb565(rgb24):
-    """Pack RGB24 without the color-channel dithering used by swscale."""
+    """Pack RGB24 for the panel's effective RGB555 output."""
     if len(rgb24) != RGB24_FRAME_SIZE:
         raise ValueError(
             "RGB24 frame must contain {} bytes".format(RGB24_FRAME_SIZE)
@@ -281,8 +255,205 @@ def pack_rgb565(rgb24):
     output_offset = 0
     for input_offset in range(0, RGB24_FRAME_SIZE, 3):
         red = (rgb24[input_offset] * 31 + 127) // 255
-        green = (rgb24[input_offset + 1] * 63 + 127) // 255
+        green = (
+            (rgb24[input_offset + 1] * RGB5_MAX + 127) // 255
+        ) << 1
         blue = (rgb24[input_offset + 2] * 31 + 127) // 255
+        pixel = (red << 11) | (green << 5) | blue
+        packed[output_offset] = pixel & 0xFF
+        packed[output_offset + 1] = pixel >> 8
+        output_offset += 2
+    return bytes(packed)
+
+
+def pack_rgb565_48(rgb48):
+    """Pack RGB48 for the panel's effective RGB555 output."""
+    if len(rgb48) != RGB48_FRAME_SIZE:
+        raise ValueError(
+            "RGB48 frame must contain {} bytes".format(RGB48_FRAME_SIZE)
+        )
+
+    packed = bytearray(FRAME_SIZE)
+    output_offset = 0
+    for red_source, green_source, blue_source in struct.iter_unpack(
+        "<HHH",
+        rgb48,
+    ):
+        red = (red_source * 31 + 32767) // 65535
+        green = (
+            (green_source * RGB5_MAX + 32767) // 65535
+        ) << 1
+        blue = (blue_source * 31 + 32767) // 65535
+        pixel = (red << 11) | (green << 5) | blue
+        packed[output_offset] = pixel & 0xFF
+        packed[output_offset + 1] = pixel >> 8
+        output_offset += 2
+    return bytes(packed)
+
+
+def pack_led_rgb565(
+    rgb,
+    dark_floor=DEFAULT_LED_DARK_FLOOR,
+    channel_max=255,
+    shadow_red_bias=DEFAULT_LED_SHADOW_RED_BIAS,
+):
+    """Pack RGB565 with local shadow cleanup for the panel's RGB555 output.
+
+    Shadow chroma is median-filtered over a 3x3 neighborhood. Locally neutral
+    neighborhoods are snapped to neutral before channel quantization, while
+    coherent warm or cool areas retain their color. Red-dominant shadow values
+    use a higher red rounding threshold to keep marginal red codes from
+    overpowering their companion channels. No minimum level is added.
+    """
+    if channel_max == 255:
+        expected_size = RGB24_FRAME_SIZE
+        source_pixels = (
+            (rgb[offset], rgb[offset + 1], rgb[offset + 2])
+            for offset in range(0, expected_size, 3)
+        )
+    elif channel_max == 65535:
+        expected_size = RGB48_FRAME_SIZE
+        source_pixels = struct.iter_unpack("<HHH", rgb)
+    else:
+        raise ValueError("channel maximum must be 255 or 65535")
+    if len(rgb) != expected_size:
+        raise ValueError(
+            "RGB frame must contain {} bytes".format(expected_size)
+        )
+    if not isinstance(dark_floor, int) or not 0 <= dark_floor <= RGB5_MAX:
+        raise ValueError(
+            "LED dark floor must be an integer between 0 and {}".format(
+                RGB5_MAX
+            )
+        )
+    if (
+        not isinstance(shadow_red_bias, (int, float))
+        or not math.isfinite(shadow_red_bias)
+        or not 0 <= shadow_red_bias <= 1
+    ):
+        raise ValueError("LED shadow red bias must be between 0 and 1")
+
+    pixels = []
+    for red, green, blue in source_pixels:
+        red_level = red * RGB5_MAX / channel_max
+        green_level = green * RGB5_MAX / channel_max
+        blue_level = blue * RGB5_MAX / channel_max
+        independent = (
+            math.floor(red_level + 0.5),
+            math.floor(green_level + 0.5),
+            math.floor(blue_level + 0.5),
+        )
+        luma_level = (
+            0.2126 * red_level
+            + 0.7152 * green_level
+            + 0.0722 * blue_level
+        )
+        is_shadow = max(independent) <= SHADOW_CHROMA_MAX_LEVEL
+        pixels.append(
+            (
+                independent,
+                luma_level,
+                (
+                    red_level - luma_level,
+                    green_level - luma_level,
+                    blue_level - luma_level,
+                ),
+                is_shadow,
+            )
+        )
+
+    filtered_chromas = []
+    for pixel_index, (
+        _independent,
+        _luma_level,
+        _chroma,
+        is_shadow,
+    ) in enumerate(pixels):
+        if not is_shadow:
+            filtered_chromas.append(None)
+            continue
+        x = pixel_index % WIDTH
+        y = pixel_index // WIDTH
+        neighborhood = []
+        for neighbor_y in range(max(0, y - 1), min(HEIGHT, y + 2)):
+            row_offset = neighbor_y * WIDTH
+            for neighbor_x in range(max(0, x - 1), min(WIDTH, x + 2)):
+                neighborhood.append(pixels[row_offset + neighbor_x][2])
+        filtered_chromas.append(
+            tuple(
+                statistics.median(
+                    chroma[component] for chroma in neighborhood
+                )
+                for component in range(3)
+            )
+        )
+
+    shadow_chroma_ranges = [
+        max(chroma) - min(chroma)
+        for chroma in filtered_chromas
+        if chroma is not None
+    ]
+    neutral_frame = (
+        bool(shadow_chroma_ranges)
+        and statistics.median(shadow_chroma_ranges)
+        < NEUTRAL_FRAME_CHROMA_THRESHOLD
+        and statistics.median(pixel[1] for pixel in pixels)
+        >= NEUTRAL_FRAME_LUMA_THRESHOLD
+    )
+    neutral_threshold = (
+        NEUTRAL_FRAME_LOCAL_CHROMA_THRESHOLD
+        if neutral_frame
+        else LOCAL_NEUTRAL_CHROMA_THRESHOLD
+    )
+
+    packed = bytearray(FRAME_SIZE)
+    output_offset = 0
+    for pixel_index, (
+        independent,
+        luma_level,
+        _chroma,
+        is_shadow,
+    ) in enumerate(pixels):
+        if not is_shadow:
+            red = independent[0]
+            green = independent[1] << 1
+            blue = independent[2]
+        elif luma_level < dark_floor / DARK_FLOOR_SUBSTEPS:
+            red = green = blue = 0
+        else:
+            filtered_chroma = filtered_chromas[pixel_index]
+            if (
+                max(filtered_chroma) - min(filtered_chroma)
+                < neutral_threshold
+            ):
+                filtered_chroma = (0, 0, 0)
+            reconstructed = tuple(
+                luma_level + chroma for chroma in filtered_chroma
+            )
+            quantized = tuple(
+                max(
+                    0,
+                    min(
+                        RGB5_MAX,
+                        math.floor(level + 0.5),
+                    ),
+                )
+                for level in reconstructed
+            )
+            red = quantized[0]
+            if red > quantized[1] and red > quantized[2]:
+                red = max(
+                    0,
+                    min(
+                        RGB5_MAX,
+                        math.floor(
+                            reconstructed[0] + 0.5 - shadow_red_bias
+                        ),
+                    ),
+                )
+            green = quantized[1] << 1
+            blue = quantized[2]
+
         pixel = (red << 11) | (green << 5) | blue
         packed[output_offset] = pixel & 0xFF
         packed[output_offset + 1] = pixel >> 8
@@ -302,6 +473,7 @@ def ffmpeg_frames(
     led_dark_floor=DEFAULT_LED_DARK_FLOOR,
     rgb5_quantizer=True,
     scaled_source=False,
+    led_shadow_red_bias=DEFAULT_LED_SHADOW_RED_BIAS,
 ):
     """Yield decoded frames from FFmpeg."""
     command = build_ffmpeg_command(
@@ -326,10 +498,18 @@ def ffmpeg_frames(
     completed = False
     try:
         while True:
-            rgb24 = read_exact(process.stdout, RGB24_FRAME_SIZE)
-            if not rgb24:
+            rgb48 = read_exact(process.stdout, RGB48_FRAME_SIZE)
+            if not rgb48:
                 break
-            yield pack_rgb565(rgb24)
+            if rgb5_quantizer and not scaled_source:
+                yield pack_led_rgb565(
+                    rgb48,
+                    led_dark_floor,
+                    channel_max=65535,
+                    shadow_red_bias=led_shadow_red_bias,
+                )
+            else:
+                yield pack_rgb565_48(rgb48)
         completed = True
     finally:
         stopping = not completed and process.poll() is None
@@ -918,14 +1098,14 @@ def add_video_preprocessing_arguments(parser):
         "--led-gamma",
         type=parse_led_gamma,
         default=DEFAULT_LED_GAMMA,
-        help="LED gamma exponent (default: %(default)s)",
+        help="LED transfer: bt709 or a gamma exponent (default: %(default)s)",
     )
     gamma.add_argument(
         "--no-led-gamma",
         dest="led_gamma",
         action="store_const",
         const=1,
-        help="disable LED gamma correction",
+        help="disable LED transfer correction",
     )
     parser.add_argument(
         "--rgb5-quantizer",
@@ -939,7 +1119,10 @@ def add_video_preprocessing_arguments(parser):
         type=parse_led_dark_floor,
         default=DEFAULT_LED_DARK_FLOOR,
         metavar="LEVEL",
-        help="pixel black cutoff, 0-31 (default: %(default)s)",
+        help=(
+            "shadow black cutoff in eighths of one RGB5 step, 0-31 "
+            "(default: %(default)s)"
+        ),
     )
     dark_floor.add_argument(
         "--no-led-dark-floor",
@@ -947,6 +1130,16 @@ def add_video_preprocessing_arguments(parser):
         action="store_const",
         const=0,
         help="select the weakest LED dark cutoff",
+    )
+    parser.add_argument(
+        "--led-shadow-red-bias",
+        type=parse_led_shadow_red_bias,
+        default=DEFAULT_LED_SHADOW_RED_BIAS,
+        metavar="BIAS",
+        help=(
+            "extra red rounding threshold in RGB5 shadows, 0-1 "
+            "(default: %(default)s)"
+        ),
     )
     parser.add_argument(
         "--scaled-source",
@@ -1091,6 +1284,7 @@ def stream_from_iina(args):
                         led_dark_floor=args.led_dark_floor,
                         rgb5_quantizer=args.rgb5_quantizer,
                         scaled_source=args.scaled_source,
+                        led_shadow_red_bias=args.led_shadow_red_bias,
                     )
                     try:
                         stream_frames(
@@ -1154,6 +1348,7 @@ def main(argv=None):
             led_dark_floor=args.led_dark_floor,
             rgb5_quantizer=args.rgb5_quantizer,
             scaled_source=args.scaled_source,
+            led_shadow_red_bias=args.led_shadow_red_bias,
         )
         if args.no_audio:
             start_callback = None

@@ -25,9 +25,11 @@ class ComparisonVariant:
     """One named post-processing configuration for the comparison grid."""
 
     name: str
-    led_gamma: float = stream.DEFAULT_LED_GAMMA
+    led_gamma: float | str = stream.DEFAULT_LED_GAMMA
     led_dark_floor: int = stream.DEFAULT_LED_DARK_FLOOR
     rgb5_quantizer: bool = True
+    led_shadow_red_bias: float = stream.DEFAULT_LED_SHADOW_RED_BIAS
+    scaled_source: bool = False
 
 
 FONT = {
@@ -72,6 +74,7 @@ FONT = {
     ".": ("00000", "00000", "00000", "00000", "00000", "00110", "00110"),
     " ": ("00000", "00000", "00000", "00000", "00000", "00000", "00000"),
 }
+PREVIEW_GAMMA = 2.2
 
 
 def parse_timestamp(value):
@@ -114,6 +117,15 @@ def load_config(path):
     fit = config.get("fit", "letterbox")
     if fit not in ("letterbox", "crop"):
         raise ValueError("comparison config fit must be letterbox or crop")
+    timestamps_value = config.get("timestamps")
+    timestamps = None
+    if timestamps_value is not None:
+        if not isinstance(timestamps_value, list) or not timestamps_value:
+            raise ValueError("comparison config timestamps must be a non-empty array")
+        try:
+            timestamps = [parse_timestamp(str(value)) for value in timestamps_value]
+        except argparse.ArgumentTypeError as error:
+            raise ValueError("comparison config contains an invalid timestamp") from error
     singular = config.get("variant")
     plural = config.get("variants")
     if singular is not None and plural is not None:
@@ -122,7 +134,13 @@ def load_config(path):
     if not isinstance(variant_tables, list) or not variant_tables:
         raise ValueError("comparison config must define at least one variant")
 
-    allowed = {"name", "led_gamma", "led_dark_floor", "rgb5_quantizer"}
+    allowed = {
+        "name",
+        "led_gamma",
+        "led_dark_floor",
+        "led_shadow_red_bias",
+        "rgb5_quantizer",
+    }
     variants = []
     names = set()
     for table in variant_tables:
@@ -159,15 +177,28 @@ def load_config(path):
         rgb5_quantizer = table.get("rgb5_quantizer", True)
         if not isinstance(rgb5_quantizer, bool):
             raise ValueError("invalid rgb5_quantizer for variant {}".format(name))
+        shadow_red_bias = table.get(
+            "led_shadow_red_bias",
+            stream.DEFAULT_LED_SHADOW_RED_BIAS,
+        )
+        try:
+            shadow_red_bias = stream.parse_led_shadow_red_bias(
+                str(shadow_red_bias)
+            )
+        except (TypeError, ValueError, argparse.ArgumentTypeError) as error:
+            raise ValueError(
+                "invalid led_shadow_red_bias for variant {}".format(name)
+            ) from error
         variants.append(
             ComparisonVariant(
                 name=name,
                 led_gamma=gamma,
                 led_dark_floor=dark_floor,
                 rgb5_quantizer=rgb5_quantizer,
+                led_shadow_red_bias=shadow_red_bias,
             )
         )
-    return fit, variants
+    return fit, variants, timestamps
 
 
 def _png_chunk(kind, payload):
@@ -226,6 +257,219 @@ def write_header_png(path, labels):
     png += _png_chunk(b"IDAT", zlib.compress(raw, 9))
     png += _png_chunk(b"IEND", b"")
     path.write_bytes(png)
+
+
+def write_rgb24_png(path, width, height, rgb24):
+    """Write an RGB24 image as a PNG using only the standard library."""
+    expected = width * height * 3
+    if len(rgb24) != expected:
+        raise ValueError("RGB24 image has an unexpected size")
+    raw = b"".join(
+        b"\x00" + rgb24[row * width * 3 : (row + 1) * width * 3]
+        for row in range(height)
+    )
+    png = b"\x89PNG\r\n\x1a\n"
+    png += _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    png += _png_chunk(b"IDAT", zlib.compress(raw, 9))
+    png += _png_chunk(b"IEND", b"")
+    path.write_bytes(png)
+
+
+def rgb565_to_cell(frame, preview_gamma=PREVIEW_GAMMA):
+    """Expand RGB565 and preview its perceived LED output on a monitor."""
+    if len(frame) != stream.FRAME_SIZE:
+        raise ValueError("RGB565 frame has an unexpected size")
+    if not math.isfinite(preview_gamma) or preview_gamma <= 0:
+        raise ValueError("preview gamma must be positive and finite")
+
+    def preview_level(level, maximum):
+        normalized = level / maximum
+        if preview_gamma != 1:
+            normalized = normalized ** (1 / preview_gamma)
+        return math.floor(normalized * 255 + 0.5)
+
+    source = bytearray(stream.WIDTH * stream.HEIGHT * 3)
+    for y in range(stream.HEIGHT):
+        for x in range(stream.WIDTH):
+            source_x = stream.WIDTH - 1 - x if stream.DISPLAY_ROTATION == 180 else x
+            source_y = stream.HEIGHT - 1 - y if stream.DISPLAY_ROTATION == 180 else y
+            source_offset = (source_y * stream.WIDTH + source_x) * 2
+            pixel = frame[source_offset] | frame[source_offset + 1] << 8
+            red = preview_level((pixel >> 11) & 31, 31)
+            # Protomatter decimates RGB565 to the configured five bitplanes,
+            # discarding green bit 0 before the value reaches the LEDs.
+            green = preview_level(((pixel >> 5) & 63) >> 1, 31)
+            blue = preview_level(pixel & 31, 31)
+            target_offset = (y * stream.WIDTH + x) * 3
+            source[target_offset : target_offset + 3] = bytes((red, green, blue))
+
+    cell = bytearray(CELL_WIDTH * CELL_HEIGHT * 3)
+    for y in range(stream.HEIGHT):
+        for x in range(stream.WIDTH):
+            source_offset = (y * stream.WIDTH + x) * 3
+            pixel = source[source_offset : source_offset + 3]
+            for y_offset in range(CELL_SCALE):
+                row_offset = ((y * CELL_SCALE + y_offset) * CELL_WIDTH + x * CELL_SCALE) * 3
+                for x_offset in range(CELL_SCALE):
+                    cell[row_offset + x_offset * 3 : row_offset + x_offset * 3 + 3] = pixel
+    return bytes(cell)
+
+
+def build_source_cell_command(source, timestamp):
+    """Build a one-frame source-column decode command."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg was not found in PATH")
+    source_filter = (
+        "scale={width}:{height}:force_original_aspect_ratio=decrease:"
+        "flags=lanczos,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:"
+        "color=black,format=rgb24"
+    ).format(width=CELL_WIDTH, height=CELL_HEIGHT)
+    return [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        format_timestamp(timestamp),
+        "-i",
+        str(source),
+        "-map",
+        "0:v:0",
+        "-an",
+        "-sn",
+        "-dn",
+        "-vf",
+        source_filter,
+        "-frames:v",
+        "1",
+        "-pix_fmt",
+        "rgb24",
+        "-f",
+        "rawvideo",
+        "pipe:1",
+    ]
+
+
+def build_image_grid_filter(row_count, column_count, header_input_index):
+    """Build a grid filter for already-rendered equal-sized PNG cells."""
+    rows = []
+    filters = []
+    for row_index in range(row_count):
+        inputs = []
+        for column_index in range(column_count):
+            input_index = row_index * column_count + column_index
+            inputs.append("[{}:v]".format(input_index))
+        row_label = "cell_row{}".format(row_index)
+        filters.append(
+            "{}hstack=inputs={}[{}]".format(
+                "".join(inputs),
+                column_count,
+                row_label,
+            )
+        )
+        rows.append("[{}]".format(row_label))
+    if row_count == 1:
+        filters.append("{}null[grid]".format(rows[0]))
+    else:
+        filters.append(
+            "{}vstack=inputs={}[grid]".format("".join(rows), row_count)
+        )
+    filters.append(
+        "[{header}:v]format=rgb24[header];"
+        "[header][grid]vstack=inputs=2[comparison]".format(
+            header=header_input_index
+        )
+    )
+    return ";".join(filters)
+
+
+def render_exact_comparison(
+    source,
+    output,
+    timestamps,
+    fit,
+    variants,
+    temp_dir,
+    frame_rate=stream.DEFAULT_FPS,
+    hwaccel="auto",
+):
+    """Render a comparison using the same ffmpeg/host packer path as live playback."""
+    labels = ["source", "scaled source"] + [variant.name for variant in variants]
+    header = temp_dir / "header.png"
+    write_header_png(header, labels)
+    cell_paths = []
+    for row_index, timestamp in enumerate(timestamps):
+        source_result = subprocess.run(
+            build_source_cell_command(source, timestamp),
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        source_cell = temp_dir / "source-{}.png".format(row_index)
+        write_rgb24_png(source_cell, CELL_WIDTH, CELL_HEIGHT, source_result.stdout)
+        cell_paths.append(source_cell)
+
+        pipelines = [
+            ("scaled", ComparisonVariant("scaled", scaled_source=True))
+        ]
+        pipelines.extend(("variant-{}".format(index), variant) for index, variant in enumerate(variants))
+        for cell_name, variant in pipelines:
+            frames = stream.ffmpeg_frames(
+                source,
+                frame_rate,
+                fit,
+                None,
+                hwaccel,
+                start_time=timestamp,
+                max_frames=1,
+                led_gamma=variant.led_gamma,
+                led_dark_floor=variant.led_dark_floor,
+                rgb5_quantizer=variant.rgb5_quantizer,
+                scaled_source=getattr(variant, "scaled_source", False),
+                led_shadow_red_bias=variant.led_shadow_red_bias,
+            )
+            try:
+                frame = next(frames)
+            finally:
+                frames.close()
+            cell_path = temp_dir / "{}-{}.png".format(cell_name, row_index)
+            write_rgb24_png(
+                cell_path,
+                CELL_WIDTH,
+                CELL_HEIGHT,
+                rgb565_to_cell(frame),
+            )
+            cell_paths.append(cell_path)
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg was not found in PATH")
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+    for cell_path in cell_paths:
+        command.extend(["-i", str(cell_path)])
+    header_input_index = len(cell_paths)
+    command.extend(
+        [
+            "-i",
+            str(header),
+            "-filter_complex",
+            build_image_grid_filter(
+                len(timestamps),
+                len(labels),
+                header_input_index,
+            ),
+            "-map",
+            "[comparison]",
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            "-threads",
+            "1",
+            str(output),
+        ]
+    )
+    subprocess.run(command, check=True)
 
 
 def build_comparison_filter(
@@ -438,7 +682,7 @@ def create_parser():
     parser.add_argument(
         "timestamps",
         type=parse_timestamp,
-        nargs="+",
+        nargs="*",
         metavar="TIMESTAMP",
         help="seconds or [HH:]MM:SS; each timestamp becomes one row",
     )
@@ -446,6 +690,17 @@ def create_parser():
         "--fit",
         choices=("letterbox", "crop"),
         default="letterbox",
+    )
+    parser.add_argument(
+        "--hwaccel",
+        default="auto",
+        help="FFmpeg hardware decoder: auto, none, or a platform name",
+    )
+    parser.add_argument(
+        "--fps",
+        type=stream.parse_frame_rate,
+        default=stream.DEFAULT_FPS,
+        help="comparison frame rate, matching live playback (default: 24)",
     )
     gamma = parser.add_mutually_exclusive_group()
     gamma.add_argument(
@@ -477,6 +732,12 @@ def create_parser():
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--led-shadow-red-bias",
+        type=stream.parse_led_shadow_red_bias,
+        default=stream.DEFAULT_LED_SHADOW_RED_BIAS,
+        metavar="BIAS",
+    )
     return parser
 
 
@@ -491,8 +752,14 @@ def main(argv=None):
 
     variants = None
     fit = args.fit
+    config_timestamps = None
     if args.config is not None:
-        fit, variants = load_config(args.config)
+        fit, variants, config_timestamps = load_config(args.config)
+    timestamps = args.timestamps or config_timestamps
+    if not timestamps:
+        raise SystemExit(
+            "provide at least one timestamp or define timestamps in the config"
+        )
     if variants is None:
         variants = [
             ComparisonVariant(
@@ -500,26 +767,23 @@ def main(argv=None):
                 args.led_gamma,
                 args.led_dark_floor,
                 args.rgb5_quantizer,
+                args.led_shadow_red_bias,
             )
         ]
 
     labels = ["source", "scaled source"] + [variant.name for variant in variants]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="movieportal-compare-") as temp_dir:
-        header = Path(temp_dir) / "header.png"
-        write_header_png(header, labels)
-        command = build_comparison_command(
+        render_exact_comparison(
             args.source,
             args.output,
-            args.timestamps,
+            timestamps,
             fit=fit,
-            led_gamma=args.led_gamma,
-            led_dark_floor=args.led_dark_floor,
-            rgb5_quantizer=args.rgb5_quantizer,
             variants=variants,
-            header=header,
+            temp_dir=Path(temp_dir),
+            frame_rate=args.fps,
+            hwaccel=args.hwaccel,
         )
-        subprocess.run(command, check=True)
     if not args.output.is_file():
         raise RuntimeError("FFmpeg produced no comparison image")
     print(
